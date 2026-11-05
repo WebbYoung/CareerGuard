@@ -1,5 +1,11 @@
 /* 纯显示规划：不修改技能、前置关系或考核进度。导航线与真实依赖明确分开。 */
 window.StarDisplay={
+  nodeBox(point,width,height,delta,baseZoom){return {x:point.x-width/(2*baseZoom),y:point.y-(height/2-delta)/baseZoom,width:width/baseZoom,height:height/baseZoom};},
+  fitView(boxes,width,height,padding=28){
+    if(!boxes.length)return {zoom:1,cx:0,cy:0};
+    const left=Math.min(...boxes.map(b=>b.x)),top=Math.min(...boxes.map(b=>b.y)),right=Math.max(...boxes.map(b=>b.x+b.width)),bottom=Math.max(...boxes.map(b=>b.y+b.height));
+    return {zoom:Math.min(1.2,Math.max(1,width-padding*2)/Math.max(1,right-left),Math.max(1,height-padding*2)/Math.max(1,bottom-top)),cx:(left+right)/2,cy:(top+bottom)/2};
+  },
   nextExpanded(current,index,effectiveOpen){const next=new Set(current);effectiveOpen?next.delete(index):next.add(index);return [...next];},
   clampCluster(point,children,width,height,zoom){
     const dx=[0,...children.map(p=>p.x)],dy=[0,...children.map(p=>p.y)];
