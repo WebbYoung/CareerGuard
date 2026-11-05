@@ -1,0 +1,106 @@
+/* 全站共享星图配色。保留业务状态色及页面结构，避免主题随导航切换。 */
+:root{color-scheme:dark;--bg:#080e1d;--paper:#121c2e;--ink:#dce6fa;--muted:#9aa9c3;--green:#a9baff;--deep:#0b1223;--lime:#b3bfff;--line:#29354e;--amber:#f3c47d;--red:#ffaca6;--ease:cubic-bezier(.23,1,.32,1)}
+body{background:var(--bg);color:var(--ink);accent-color:#9baeff;scrollbar-color:#435476 #0c1526}
+:where(button,a,input,textarea,select,summary,[tabindex]):focus-visible{outline:2px solid #a7bbff;outline-offset:4px}
+::selection{background:#43538c;color:#fff}
+.shell{background:var(--bg)}
+.sidebar,.admin-sidebar{background:#0b1223;border-right:1px solid #202a40;color:#a7b5ce}
+.brand,.brand-mark,.admin-brand,.site-brand{color:#bdcaff}
+.brand-en,.brand-beta,.admin-brand small,.site-brand small{color:#a6b5d6}
+.brand-beta{background:#23304b;border-color:#3b4b6c}
+.nav-caption,.admin-caption{color:#94a5c4}
+.nav-item{color:#9aaac6}
+.nav-item.active{background:#252d4e;color:#e4eaff;box-shadow:inset 2px 0 #9daaff}
+.nav-divider{background:var(--line)}
+.topbar,.admin-top{background:#0c1424;border-color:var(--line);color:var(--muted)}
+.breadcrumb,.breadcrumb strong,.breadcrumb>span{color:#a9b7d0}
+.top-actions .button,.icon-button{background:#182338;color:#c4cfea;border:1px solid #33415d}
+.avatar,.top-avatar{background:#283656;color:#d6e1ff}
+.sidebar-footer small,.admin-sidebar-foot{color:#9aaac6}
+.private-card{background:#152139;border-color:#354564}
+.private-card p,.private-card .text-link,.text-link.light{color:#b2c2e2}
+.eyebrow,.heading-dot,.journey-card>svg,.panel-header h3>svg,.evidence-ref,.recent-item>svg{color:#a4b5f9}
+.button.primary,.button.lime,.pill.dark,.pill.lime{background:#8799ed;border:1px solid #a1b2ff;color:#0b1228}
+.button.secondary,.button.subtle,.pill{background:#19263d;border:1px solid #354564;color:#d0ddf5}
+.button.danger-soft{background:#38232f;color:#ffb9b2;border:1px solid #62404c}
+.button.danger{background:#a44750;color:#fff}
+.panel,.metric,.journey-card,.week-card,.entry-card,.demo-panel{background:var(--paper);border-color:var(--line)}
+.metric-value,.coverage strong{color:#c0ccff}
+.hero{background:#14213a;border:1px solid #304061}
+.hero-kicker,.hero p,.hero-notes,.hero-notes svg{color:#b3c2df}
+.orbit{border-color:#748bc945}.orbit-cross,.orbit-cross:after{background:#8299d0}
+.orbit-one:before,.orbit-two:after{background:#a2b4ff}
+.shield-glow{background:radial-gradient(circle,#819aeb25,transparent 70%)}
+.shield-back{fill:#6175b6;stroke:#8b9fd9}.shield-front{fill:#b8c6ff;stroke:#cad5ff}.shield-check{stroke:#354777}
+.float-tag,.float-note{background:#1b2943;color:#dde6fb;border:1px solid #405274;box-shadow:0 12px 30px #0003}
+.float-icon,.float-icon.gold,.tag-check,.upload-circle,.model-logo,.llm-logo{background:#253451;color:#bccbff;border-color:#3b4b6c}
+.float-tag small,.art-caption,.metric-top,.metric-value span,.metric p,.section-heading>span,.step-no,.journey-card p,.recent-item>time,.empty-mini,.model-row small,.model-foot,.page-footer,.field label span,.fine-print,.muted,.panel-description,.security-item p,.loading-label:after{color:var(--muted)}
+.journey-link{border-color:var(--line);color:#b4c4ff}
+.green,.badge.green,.test-result.safe{background:#173b37;color:#9ce2c7;border-color:#2c5b51}
+.amber,.amber-notice,.ocr-line,.test-result.blocked{background:#342b20;color:#f3ce92;border-color:#655136}
+.red,.badge.red{background:#392530;color:#ffb5b1}
+.blue{background:#193344;color:#a3d8ee}.violet{background:#2b2947;color:#d2befd}
+.badge.neutral{background:#253149;color:#b8c8e3}
+input:not([type=checkbox]):not([type=radio]),select,textarea,.portal-field input{background:#0c1526;border:1px solid #384966;color:#e0e9fa}
+input::placeholder,textarea::placeholder{color:#97a7c2;opacity:1}
+.check-line,.job-description,.ai-content,.finding p,.week-card ul,.week-card .deliverable,dialog p,dialog ol,.voice-status{color:#b0bfd8}
+.check-line input,.answer-option input{accent-color:#9baeff}
+.dropzone{background:#0e192c;border-color:#566b95}
+.dropzone strong span{color:#b6c8ff}
+.dropzone small,.dropzone #file-label,.separator,.ocr-line small,.risk-score-panel p,.score-dial div>span,.score-legend{color:var(--muted)}
+.dropzone.dragging{background:#202e4b;border-color:#a1b4ff}
+.text-preview,.masked-panel .text-preview,.demo-result pre{background:#0c1526;border-color:#2e3e5b;color:#c7d5ee}
+.meta-strip,.notice,.report-banner,.test-result,.demo-cta,.demo-ephemeral{background:#17243c;border-color:#354766;color:#bacbed}
+.notice.amber-notice{background:#342b20;border-color:#655136;color:#f3ce92}
+.finding{background:#101b2e;border-color:#30405b}
+.finding .quote{background:#3b3021;color:#ffcf87}
+.masked-panel{background:#12252b;border-color:#31524e}
+.report-banner p,.coverage span,.week-label,.week-card .focus,.security-item>svg{color:#afc1ec}
+th{background:#18243a;color:#bbcae3}td{border-color:var(--line);color:#c3cfe4}
+mark{background:#624822;color:#ffe0a7}mark.pii{background:#603545;color:#ffd2d9}
+.toast{background:#233251;color:#e5edff;border-color:#546990;box-shadow:0 12px 32px #0005}
+.toast.error{background:#572b39;border-color:#a06372}
+dialog{background:#121d30;border-color:#3b4b69;color:var(--ink);box-shadow:0 24px 90px #0008}
+dialog::backdrop{background:#020714b3}
+.panel hr,.admin-security,.exam-question{border-color:var(--line)}
+.bubble{background:#1b2942;color:#e0e9fa}.bubble.user{background:#303d67;color:#eff3ff}
+.bubble small,.bubble.user small{color:#bbc9eb}
+.voice-orb{background:radial-gradient(circle at 35% 25%,#a2b3ff,#4a5c9c);box-shadow:0 0 0 10px #28345666}
+@keyframes voicePulse{50%{transform:scale(1.04);box-shadow:0 0 0 17px #6378c333}}
+.feedback-note{background:#342b20;border-color:#655136;color:#f3ce92}
+.answer-option{background:#18243a;color:#d6e1f6}
+.answer-option:has(input:checked){background:#2d3a60;outline:1px solid #9baeff}
+.answer-feedback{background:#173b37;color:#bce8d6}.answer-feedback.wrong{background:#392530;color:#ffd1cc}
+.camera-tools,.camera-settings-popover{background:#141f33;border-color:#354564}
+.camera-tool-icon,.camera-settings summary{color:#b5c5f5}
+.camera-tools .camera-status,.camera-settings-popover p{color:#acbdd8}
+.camera-tools .camera-status.error{color:#ffb2ab}.camera-tools .camera-status.adjust{color:#f3ca8c}
+.camera-mini,.camera-mini-header{background:#14213a;color:#d3dfff}
+.camera-mini-status{color:#b6c5e5}.camera-mini-action{border-color:#4b6085;color:#d6e2ff}
+.camera-placeholder{background:#101b2e;color:#a1b4dd}
+/* 公共入口与身份页面沿用同一材质，不合并其独立导航和登录流程。 */
+.site-mark{background:#243351;color:#bacaff}
+.hero-badge{background:#18243a;border-color:#354564;color:#becdf0}.hero-badge span{background:#a5b6ff}
+.landing-hero h1 em{color:#a5b6ff}
+.hero-description,.hero-footnote,.feature-number,.site-footer,.auth-switch,.auth-minor,.password-toggle,.demo-caption,.demo-findings,.demo-cta p,.demo-ephemeral p{color:var(--muted)}
+.hero-visual{background:#111e34;border:1px solid #2c3d59}
+.hero-orbit{border-color:#576d9b}
+.proof-sheet{background:#1b2943;border-color:#415376;box-shadow:0 25px 60px #0004}
+.proof-sheet .sheet-title{color:#b0c0e8}.sheet-line{background:#354564}
+.sheet-check b,.sheet-route span{background:#293959;color:#c1d2ff;border-color:#4b6085}.sheet-route i{background:#5e729d}
+.float-note.two,.entry-card.featured,.auth-story{background:#192741;color:#e4ecff;border-color:#405274}
+.entry-card.featured .eyebrow,.entry-card.featured p,.auth-story p,.auth-story .eyebrow,.auth-steps,.auth-steps span{color:#b5c6ea}
+.auth-story:after{border-color:#8199d54d}
+.auth-switch a{color:#bbcaff}.portal-message{color:#ffb5ad}.portal-message.success{color:#9ce2c7}
+.demo-tabs button[aria-pressed=true]{background:#2b395f;color:#e3ebff;border-color:#8196d1}
+.demo-score{color:#f3c47d}
+.admin-sidebar nav a{color:#a7b8d7}.admin-sidebar-foot button{color:#cfdbff}
+@media(hover:hover) and (pointer:fine){
+ .nav-item:not(.active):hover,.admin-sidebar nav a:hover{background:#1c2943;color:#dce6ff}
+ .button.primary:hover,.button.lime:hover,.pill.dark:hover,.pill.lime:hover{background:#a5b4ff;color:#0b1228}
+ .button.secondary:hover,.button.subtle:hover,.pill:hover,.camera-settings summary:hover{background:#263654;border-color:#637bad;color:#e1eaff}
+ .journey-card:hover,.entry-card:hover{border-color:#657db2;box-shadow:0 12px 30px #02071433}
+ .dropzone:hover{background:#172641;border-color:#829bdb}
+ .text-link:hover,.site-nav a:hover,.site-footer a:hover{color:#d4ddff}
+}
+@media(prefers-reduced-motion:reduce){.pill,.entry-card{transition:none}.pill:hover,.entry-card:hover{transform:none}}

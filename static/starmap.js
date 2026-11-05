@@ -227,7 +227,7 @@ window.StarMap=(()=>{
       if(candidates.length){event.preventDefault();candidates[0].b.focus();}
     });
     let resizeFrame=0;window.addEventListener('resize',()=>{cancelAnimationFrame(resizeFrame);resizeFrame=requestAnimationFrame(()=>{if(state.view==='tree'&&S.graph)draw(true);});});
-    window.addEventListener('viewchange',event=>{document.body.classList.toggle('star-theme',event.detail==='tree');if(event.detail==='tree')showAchievement();else get('star-achievement').hidden=true;});
+    window.addEventListener('viewchange',event=>{document.body.classList.add('star-theme');if(event.detail==='tree')showAchievement();else get('star-achievement').hidden=true;});
   }
   function clearAll(){platform.canvas?.cancel();cancelAnimationFrame(S.wheelFrame);cancelAnimationFrame(S.dragFrame);clearTimeout(S.settleTimer);S.wheelFrame=0;S.dragFrame=0;S.drag=null;S.positions.clear();S.gridUnits.clear();S.full=false;S.expanded.clear();S.graph=null;S.progress=[];S.focus=null;S.selected=null;S.mode='live';S.pendingAchievements=[];if(S.initialized){modeUI();drawEmpty();}}
   return {init,load,select,clear,overview,draw,renderDetail,applyExam,clearAll,dragNode,endNodeDrag,wheelZoom,get mode(){return S.mode;}};
