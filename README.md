@@ -218,3 +218,8 @@ career-guard/
 ## v0.9.1：子节点有序展开
 
 职业分组内使用固定网格，按前置关系与名称稳定排序，显示学习序号。反复展开保持位置，拖动分组时子节点整体跟随。详见 [有序布局说明](docs/STARMAP_ORDERING.md)。
+
+
+## 前端视觉版本 v0.11.0
+
+首页、工作台、星图与独立账户/后台统一为深色玻璃风格。公共视觉样式位于 `static/cinematic.css`，动效与入口增强位于 `static/cinematic.js`，独立生成素材位于 `static/assets/`。无需增加部署步骤；启动后刷新页面即可。设计说明与验证见 `docs/CINEMATIC_DESIGN.md`。

@@ -202,7 +202,6 @@ async function initPlatform(){
   const account=node('button','button secondary small auth-top','个人中心');account.id='account-top';account.dataset.go='profile';$('.top-actions').prepend(account);
   const next=node('article','panel spaced');next.append(node('span','eyebrow','FROM PLAN TO PRACTICE'),node('h2','','把计划展开成技能树'),node('p','fine-print','先识别能力差距，再沿着技能依赖完成实践，用节点考试发现仍需巩固的部分。'));
   const note=node('p','fine-print');note.id='career-tree-note';next.append(note);const row=node('div','button-row');row.append(button('进入 AI 职业技能树',()=>show('tree'),'primary'),button('进入 AI 面试',()=>show('interview')));next.append(row);$('#view-career').append(next);
-  const launch=node('div','button-row spaced');launch.append(button('发现推荐岗位',()=>show('jobs')),button('探索职业技能树',()=>show('tree')));$('#view-overview').append(launch);
   document.addEventListener('click',event=>{const b=event.target.closest('[data-platform]');if(!b||!platformHandlers[b.dataset.platform])return;
     if(['interrupt','end-interview'].includes(b.dataset.platform)){Promise.resolve(platformHandlers[b.dataset.platform]()).catch(e=>toast(e.message,true));return;}
     platformRun(platformHandlers[b.dataset.platform],b);});
@@ -220,5 +219,7 @@ async function initPlatform(){
   // 原有会话启动完成后获取账号状态，不重复调用需要模型检查的bootstrap。
   if(!state.csrf)await new Promise(resolve=>{const timer=setInterval(()=>{if(state.csrf){clearInterval(timer);resolve();}},100);setTimeout(()=>{clearInterval(timer);resolve();},8000);});
   await loadAccount();
+  window.careerPlatformReady = true;
+  window.dispatchEvent(new Event('platform-loaded'));
 }
 initPlatform().catch(e=>toast(e.message,true));
