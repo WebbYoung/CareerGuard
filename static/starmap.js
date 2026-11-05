@@ -2,7 +2,7 @@
 window.StarMap=(()=>{
   const palette=['#87adf2','#b19cea','#74c8bd','#a6a1ee','#d1a1bb','#8ebbd3','#aecb93','#c6ad89','#92a5d7'];
   const glyphs=['⌘','⬡','▥','✦','◇','☁','✓','▯','⌁'];
-  const S={mode:'live',graph:null,progress:[],focus:null,selected:null,zoom:1,layout:null,initialized:false,achievementTimer:null,pendingAchievements:[],positions:new Map(),drag:null,dragFrame:0,wheelFrame:0,wheelDelta:0,settleTimer:0,full:false,expanded:new Set(),display:null};
+  const S={mode:'live',graph:null,progress:[],focus:null,selected:null,zoom:1,layout:null,initialized:false,achievementTimer:null,pendingAchievements:[],positions:new Map(),drag:null,dragFrame:0,wheelFrame:0,wheelDelta:0,settleTimer:0,full:false,expanded:new Set(),display:null,gridUnits:new Map()};
   const get=id=>document.getElementById(id),el=(tag,cls='',value='')=>node(tag,cls,value);
   function setText(id,value){get(id).textContent=value;}
   function careerIndex(id){return Math.max(0,S.graph.careers.findIndex(c=>c.id===id));}
@@ -55,7 +55,9 @@ window.StarMap=(()=>{
     for(const [id,p] of S.layout.points)if(p.kind==='skill'&&!S.display.skillIds.has(id))S.layout.points.delete(id);
     S.display.groups.forEach(group=>{const angle=-Math.PI*.75+group.index*.85,radius=[240,350,470,580][group.index];S.layout.points.set(group.id,{kind:'group',x:S.layout.cx+Math.cos(angle)*radius,y:S.layout.cy+Math.sin(angle)*radius});});
     if(fit)S.zoom=S.focus?Math.max(.4,fitZoom()):fitZoom();
-    S.layout=StarGraph.separate(S.layout,S.zoom,S.positions.get(layoutKey())||new Map(),displayedIds());
+    S.layout.gridZoom=S.gridUnits.get(layoutKey())||S.zoom;
+    S.layout=S.focus?window.StarDisplay.orderedLayout(g,S.display,S.layout,S.zoom,S.positions.get(layoutKey())||new Map()):StarGraph.separate(S.layout,S.zoom,S.positions.get(layoutKey())||new Map(),displayedIds());
+    if(S.focus)S.gridUnits.set(layoutKey(),S.layout.gridZoom);
     const scene=get('tree-scene');scene.replaceChildren();scene.style.width=S.layout.width+'px';scene.style.height=S.layout.height+'px';
     const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('width',S.layout.width);svg.setAttribute('height',S.layout.height);svg.setAttribute('aria-hidden','true');scene.append(svg);
     for(const [id,p] of S.layout.points){
@@ -66,6 +68,7 @@ window.StarMap=(()=>{
       const label=kind==='student'?(g.learner_label||'学习者成长起点'):group?group.stage:n?n.name:c.name;b.append(el('span','star-node-label',label));
       b.append(el('span','star-node-meta',kind==='student'?'成长起点':group?(group.expanded?'点击收起 '+group.count+' 项':group.hiddenCount?'还有 '+group.hiddenCount+' 项技能':'该阶段技能已显示'):c?'技能覆盖率 '+c.coverage+'%':n.shared_count>1?'共享于 '+n.shared_count+' 个方向':n.status==='locked'?'前置待完成':n.status==='completed'?'考核完成':'可以学习'));
       if(group)b.setAttribute('aria-expanded',String(group.expanded));
+      const rank=S.layout.order?.get(id);if(rank){const badge=el('span','star-node-rank',String(rank).padStart(2,'0'));badge.setAttribute('aria-hidden','true');b.append(badge);}
       b.setAttribute('aria-label',label+(group?'，'+group.count+'项技能，'+(group.expanded?'点击收起':'点击展开'):n?'，'+({locked:'未解锁',available:'可学习',completed:'已完成'}[n.status]):c?'，技能覆盖率'+c.coverage+'%':''));b.setAttribute('aria-pressed',String(S.selected===id));
       if(c)b.style.setProperty('--career-color',theme(id).color);scene.append(b);
     }
@@ -114,7 +117,8 @@ window.StarMap=(()=>{
   }
   function clear(){S.selected=null;draw();}
   function overview(){S.full=false;S.expanded.clear();S.focus=null;S.selected=null;draw(true);}
-  function toggleStage(index){if(!S.focus)return;const canvasFocus=get('tree-scene').contains(document.activeElement);S.full=false;S.selected=null;S.expanded=new Set(window.StarDisplay.nextExpanded([...S.expanded],index,Boolean(S.display.groups.find(g=>g.index===index)?.expanded)));draw();const target=canvasFocus?[...get('tree-scene').querySelectorAll('[data-skill-id]')].find(b=>b.dataset.skillId==='@stage:'+index):[...get('star-stage-list').querySelectorAll('button')].find(b=>b.dataset.starStage===String(index));target?.focus({preventScroll:true});}
+  function toggleStage(index){if(!S.focus)return;const canvasFocus=get('tree-scene').contains(document.activeElement);S.full=false;S.selected=null;S.expanded=new Set(window.StarDisplay.nextExpanded([...S.expanded],index,Boolean(S.display.groups.find(g=>g.index===index)?.expanded)));draw();const target=canvasFocus?[...get('tree-scene').querySelectorAll('[data-skill-id]')].find(b=>b.dataset.skillId==='@stage:'+index):[...get('star-stage-list').querySelectorAll('button')].find(b=>b.dataset.starStage===String(index));target?.focus({preventScroll:true});if(S.display.groups.find(g=>g.index===index)?.expanded)revealStage(index);}
+  function revealStage(index){const point=S.layout.points.get('@stage:'+index);if(!point)return;const vp=get('tree-scroll'),scene=get('tree-scene');vp.scrollLeft=scene.offsetLeft+point.x*S.zoom-vp.clientWidth/2;vp.scrollTop=scene.offsetTop+point.y*S.zoom-65;}
   function dependencies(){if(!S.focus)return;S.full=!S.full;draw();}
   function addHeading(root,label,values){root.append(el('h3','',label));const ul=el('ul');values.forEach(value=>ul.append(el('li','',value)));root.append(ul);}
   function skillButtons(root,ids,g){const list=el('div','star-skill-list');ids.forEach(id=>{const n=g.nodes.find(n=>n.id===id);if(!n)return;const b=el('button','',`${n.status==='completed'?'✓':n.status==='available'?'✧':'○'} ${n.name}`);b.type='button';b.addEventListener('click',()=>select(id));list.append(b);});root.append(list);}
@@ -167,7 +171,7 @@ window.StarMap=(()=>{
     vp.scrollLeft=scene.offsetLeft+wx*S.zoom-sx;vp.scrollTop=scene.offsetTop+wy*S.zoom-sy;
     clearTimeout(S.settleTimer);S.settleTimer=setTimeout(()=>{
       if(!S.graph||S.drag)return;
-      S.layout=StarGraph.separate(S.layout,S.zoom,S.positions.get(layoutKey())||new Map(),displayedIds());applyZoom();
+      S.layout=S.focus?window.StarDisplay.orderedLayout(view(),S.display,S.layout,S.zoom,S.positions.get(layoutKey())||new Map()):StarGraph.separate(S.layout,S.zoom,S.positions.get(layoutKey())||new Map(),displayedIds());if(S.focus)S.gridUnits.set(layoutKey(),S.layout.gridZoom);applyZoom();
     },150);
   }
   function zoom(delta){setZoom(S.zoom+delta);}
@@ -178,30 +182,31 @@ window.StarMap=(()=>{
   }
   function updateDraggedNode(){
     if(!S.drag)return;const d=S.drag,p=S.layout.points.get(d.id);
-    p.x=Math.max(85/S.zoom,Math.min(S.layout.width-90/S.zoom,d.x+d.dx/S.zoom));
-    p.y=Math.max(45/S.zoom,Math.min(S.layout.height-100/S.zoom,d.y+d.dy/S.zoom));
-    const b=[...get('tree-scene').querySelectorAll('[data-skill-id]')].find(b=>b.dataset.skillId===d.id);
-    if(b){b.style.left=(p.x-56)+'px';b.style.top=(p.y-Number(b.dataset.layoutHeight)/2+Number(b.dataset.anchor)/S.zoom)+'px';}
-    get('tree-scene').querySelectorAll('path[data-from]').forEach(path=>{if(path.dataset.from===d.id||path.dataset.to===d.id)path.setAttribute('d',pathFor(path.dataset.from,path.dataset.to,path.dataset.aggregate==='true'));});
+    const offsets=[...d.children.values()].map(origin=>({x:origin.x-d.x,y:origin.y-d.y}));
+    Object.assign(p,window.StarDisplay.clampCluster({...p,x:d.x+d.dx/S.zoom,y:d.y+d.dy/S.zoom},offsets,S.layout.width,S.layout.height,S.zoom));
+    const changed=new Set([d.id]);for(const [childId,origin] of d.children){const child=S.layout.points.get(childId);child.x=origin.x+p.x-d.x;child.y=origin.y+p.y-d.y;changed.add(childId);}
+    for(const b of get('tree-scene').querySelectorAll('[data-skill-id]'))if(changed.has(b.dataset.skillId)){const point=S.layout.points.get(b.dataset.skillId);b.style.left=(point.x-56)+'px';b.style.top=(point.y-Number(b.dataset.layoutHeight)/2+Number(b.dataset.anchor)/S.zoom)+'px';}
+    get('tree-scene').querySelectorAll('path[data-from]').forEach(path=>{if(changed.has(path.dataset.from)||changed.has(path.dataset.to))path.setAttribute('d',pathFor(path.dataset.from,path.dataset.to,path.dataset.aggregate==='true'));});
   }
   function dragNode(id,dx,dy){
     if(!S.graph||!S.layout.points.has(id))return;
-    if(!S.drag){const p=S.layout.points.get(id);S.drag={id,x:p.x,y:p.y,dx:0,dy:0};get('tree-scene').querySelectorAll('.star-energy').forEach(dot=>dot.remove());clearTimeout(S.settleTimer);}
+    if(!S.drag){const p=S.layout.points.get(id);S.drag={id,x:p.x,y:p.y,dx:0,dy:0,children:new Map()};const group=S.display?.groups.find(g=>g.id===id);if(group)for(const n of S.graph.nodes.filter(n=>n.stage===group.stage&&S.layout.points.has(n.id))){const child=S.layout.points.get(n.id);S.drag.children.set(n.id,{x:child.x,y:child.y});}get('tree-scene').querySelectorAll('.star-energy').forEach(dot=>dot.remove());clearTimeout(S.settleTimer);}
     S.drag.dx=dx;S.drag.dy=dy;
     if(!S.dragFrame)S.dragFrame=requestAnimationFrame(()=>{S.dragFrame=0;updateDraggedNode();});
   }
   function endNodeDrag(id,cancelled=false){
     if(!S.drag||S.drag.id!==id)return;cancelAnimationFrame(S.dragFrame);S.dragFrame=0;updateDraggedNode();const d=S.drag;S.drag=null;
-    if(cancelled){Object.assign(S.layout.points.get(id),{x:d.x,y:d.y});}
+    if(cancelled){Object.assign(S.layout.points.get(id),{x:d.x,y:d.y});for(const [childId,origin] of d.children)Object.assign(S.layout.points.get(childId),origin);}
     else{
-      const others=[...S.layout.points].filter(([other])=>other!==id&&displayedIds().has(other)).map(([,p])=>p);
-      const p=StarGraph.freePosition(S.layout.points.get(id),others,S.zoom);S.layout.points.set(id,p);
+      const others=[...S.layout.points].filter(([other])=>other!==id&&!d.children.has(other)&&displayedIds().has(other)).map(([,p])=>p);
+      const offsets=[...d.children.values()].map(origin=>({x:origin.x-d.x,y:origin.y-d.y}));const p=S.focus?window.StarDisplay.freeCluster(S.layout.points.get(id),offsets,others,S.zoom):StarGraph.freePosition(S.layout.points.get(id),others,S.zoom);S.layout.points.set(id,p);
       S.layout.width=Math.max(S.layout.width,p.x+90/S.zoom);S.layout.height=Math.max(S.layout.height,p.y+100/S.zoom);
-      const saved=S.positions.get(layoutKey())||new Map();saved.set(id,{x:p.x,y:p.y});S.positions.set(layoutKey(),saved);
+      const saved=S.positions.get(layoutKey())||new Map();for(const [childId,origin] of d.children){const child=S.layout.points.get(childId);child.x=origin.x+p.x-d.x;child.y=origin.y+p.y-d.y;if(saved.has(childId))saved.set(childId,{x:child.x,y:child.y});}saved.set(id,{x:p.x,y:p.y});S.positions.set(layoutKey(),saved);
     }
+    S.layout.width=Math.max(S.layout.width,...[...S.layout.points.values()].map(p=>p.x+100/S.zoom));S.layout.height=Math.max(S.layout.height,...[...S.layout.points.values()].map(p=>p.y+110/S.zoom));
     applyZoom();
   }
-  function arrange(){if(!S.graph)return;S.positions.delete(layoutKey());draw(true);}
+  function arrange(){if(!S.graph)return;S.positions.delete(layoutKey());S.gridUnits.delete(layoutKey());draw(true);}
   function reset(){if(S.mode!=='demo')return;[...S.positions.keys()].filter(k=>k.startsWith('demo:')).forEach(k=>S.positions.delete(k));S.full=false;S.expanded.clear();S.progress=[];S.focus=null;S.selected=null;S.pendingAchievements=[];get('star-achievement').hidden=true;draw(true);toast('演示已重置，个人学习记录未修改。');}
   function init(){
     if(S.initialized)return;S.initialized=true;modeUI();drawEmpty();
@@ -217,6 +222,6 @@ window.StarMap=(()=>{
     let resizeFrame=0;window.addEventListener('resize',()=>{cancelAnimationFrame(resizeFrame);resizeFrame=requestAnimationFrame(()=>{if(state.view==='tree'&&S.graph)draw(true);});});
     window.addEventListener('viewchange',event=>{document.body.classList.toggle('star-theme',event.detail==='tree');if(event.detail==='tree')showAchievement();else get('star-achievement').hidden=true;});
   }
-  function clearAll(){platform.canvas?.cancel();cancelAnimationFrame(S.wheelFrame);cancelAnimationFrame(S.dragFrame);clearTimeout(S.settleTimer);S.wheelFrame=0;S.dragFrame=0;S.drag=null;S.positions.clear();S.full=false;S.expanded.clear();S.graph=null;S.progress=[];S.focus=null;S.selected=null;S.mode='live';S.pendingAchievements=[];if(S.initialized){modeUI();drawEmpty();}}
+  function clearAll(){platform.canvas?.cancel();cancelAnimationFrame(S.wheelFrame);cancelAnimationFrame(S.dragFrame);clearTimeout(S.settleTimer);S.wheelFrame=0;S.dragFrame=0;S.drag=null;S.positions.clear();S.gridUnits.clear();S.full=false;S.expanded.clear();S.graph=null;S.progress=[];S.focus=null;S.selected=null;S.mode='live';S.pendingAchievements=[];if(S.initialized){modeUI();drawEmpty();}}
   return {init,load,select,clear,overview,draw,renderDetail,applyExam,clearAll,dragNode,endNodeDrag,wheelZoom,get mode(){return S.mode;}};
 })();
