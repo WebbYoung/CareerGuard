@@ -27,3 +27,14 @@ body.star-theme{background:#080e1d;color:#dce6fa}body.star-theme .shell{backgrou
 @media(max-width:700px){.star-display-actions{gap:8px}.star-dependency-toggle{font-size:9px;padding:6px 7px}.star-stage-list{padding:10px;gap:6px}.star-stage-list button{font-size:8px;padding:6px}}
 
 .star-node-rank{position:absolute;top:0;right:15px;display:grid;place-items:center;min-width:17px;height:17px;padding:0 3px;border:1px solid #50678e;border-radius:5px;background:#15243c;color:#a8bddf;font-size:8px;font-variant-numeric:tabular-nums;pointer-events:none}
+
+/* 技能路径阅读区放大：标题更醒目，主画布获得更多宽高。 */
+body.star-theme main{max-width:none;padding-left:24px;padding-right:24px}
+.star-map-top strong{font-size:22px;line-height:1.5;font-weight:650}
+.star-map-top span{font-size:11px;max-width:720px;line-height:1.8}
+.star-map-top{padding:20px 22px}
+.star-node.skill .star-node-label,.star-node.group .star-node-label{font-size:12px}
+.star-node.skill,.star-node.group{height:124px}
+@media(min-width:1001px){.star-main{grid-template-columns:minmax(0,1fr) 280px}.star-viewport.tree-scroll{height:clamp(680px,76vh,1000px);min-height:680px;max-height:1000px}}
+@media(min-width:701px) and (max-width:1000px){.star-viewport.tree-scroll{height:clamp(600px,75vh,850px);min-height:600px;max-height:850px}}
+@media(max-width:700px){body.star-theme main{padding-left:16px;padding-right:16px}.star-map-top{padding:16px}.star-map-top strong{font-size:18px}.star-map-top span{font-size:10px}.star-map-top{align-items:flex-start;flex-wrap:wrap}}
