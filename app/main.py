@@ -11,6 +11,7 @@ from .store import store
 from .platform_api import router as platform_router, load_model_settings
 from .database import ensure_superuser
 from .vision_api import router as vision_router
+from .onboarding_api import router as onboarding_router
 from .services import vision
 
 
@@ -80,6 +81,7 @@ async def generic_error(request, exc):
 app.include_router(router)
 app.include_router(platform_router)
 app.include_router(vision_router)
+app.include_router(onboarding_router)
 app.mount('/static', StaticFiles(directory=ROOT/'static'), name='static')
 
 

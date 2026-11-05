@@ -101,6 +101,74 @@ Ollama模式无需API密钥；DeepSeek密钥只能从环境或本机 `.env` 读�
 
 ## ② Python 后端完整代码
 
+### `app/onboarding_api.py`
+
+```python
+"""首次使用引导：由当前Session确定账号，沿用CSRF校验。"""
+from typing import Literal
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import Field
+from .api import Input, payload
+from .database import connect, event
+from .platform_api import current
+from .services.onboarding import GUIDE_ID, GUIDE_STEPS
+
+router = APIRouter(prefix='/api')
+
+
+class GuideUpdate(Input):
+    action: Literal['start','progress','complete','skip']
+    step: int = Field(default=0, ge=0, lt=GUIDE_STEPS)
+
+
+def summary(row):
+    status = row['status'] if row else 'not_started'
+    return {'guide_id':GUIDE_ID,'steps':GUIDE_STEPS,'status':status,
+            'step':row['step'] if row else 0,'auto_start':status in ('pending','active')}
+
+
+@router.get('/onboarding')
+async def read_guide(request:Request):
+    user = current(request)
+    with connect() as db:
+        row = db.execute('SELECT status,step FROM user_guides WHERE user_id=? AND guide_id=?',(user['id'],GUIDE_ID)).fetchone()
+    return summary(row)
+
+
+@router.post('/onboarding')
+async def update_guide(request:Request):
+    user = current(request)
+    data = await payload(request,GuideUpdate)
+    if data.action == 'complete' and data.step != GUIDE_STEPS-1:
+        raise HTTPException(422,'请完成最后一个引导步骤后再结束。')
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT status,step FROM user_guides WHERE user_id=? AND guide_id=?',(user['id'],GUIDE_ID)).fetchone()
+        if data.action == 'start':
+            status,step = 'active',0
+        else:
+            if row is None:
+                raise HTTPException(409,'请先开启引导。')
+            if row['status'] in ('completed','skipped'):
+                return summary(row)
+            status = {'progress':'active','complete':'completed','skip':'skipped'}[data.action]
+            step = data.step
+        db.execute('INSERT INTO user_guides(user_id,guide_id,status,step) VALUES (?,?,?,?) '
+                   'ON CONFLICT(user_id,guide_id) DO UPDATE SET status=excluded.status,step=excluded.step,updated=CURRENT_TIMESTAMP',
+                   (user['id'],GUIDE_ID,status,step))
+        if data.action in ('complete','skip'):
+            event(db,user['id'],'onboarding_'+status)
+    return summary({'status':status,'step':step})
+```
+
+### `app/services/onboarding.py`
+
+```python
+"""引导版本与步数。只保存界面进度，不保存表单或材料。"""
+GUIDE_ID = 'welcome-v1'
+GUIDE_STEPS = 10
+```
+
 ### `run.py`
 
 ```python
@@ -304,6 +372,7 @@ from .store import store
 from .platform_api import router as platform_router, load_model_settings
 from .database import ensure_superuser
 from .vision_api import router as vision_router
+from .onboarding_api import router as onboarding_router
 from .services import vision
 
 
@@ -373,6 +442,7 @@ async def generic_error(request, exc):
 app.include_router(router)
 app.include_router(platform_router)
 app.include_router(vision_router)
+app.include_router(onboarding_router)
 app.mount('/static', StaticFiles(directory=ROOT/'static'), name='static')
 
 
@@ -739,6 +809,9 @@ CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT NOT NULL 
  password TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', disabled INTEGER NOT NULL DEFAULT 0,
  created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS auth_sessions(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS user_guides(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ guide_id TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',step INTEGER NOT NULL DEFAULT 0,
+ updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(user_id,guide_id));
 CREATE TABLE IF NOT EXISTS profiles(user_id INTEGER PRIMARY KEY REFERENCES users(id), occupation TEXT NOT NULL DEFAULT '', resume TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES users(id), title TEXT NOT NULL,
  company TEXT NOT NULL, description TEXT NOT NULL, recommended INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created TEXT DEFAULT CURRENT_TIMESTAMP);
@@ -868,6 +941,7 @@ from .api import Input, authorize, payload, compute
 from .database import connect, encode, password_hash, password_ok, cipher, event, ensure_superuser
 from .store import store
 from .services import growth, llm, starmap
+from .services.onboarding import GUIDE_ID
 
 router=APIRouter(prefix='/api')
 failures=defaultdict(deque)
@@ -953,6 +1027,7 @@ async def register(request:Request,response:Response):
             uid=db.execute('INSERT INTO users(username,password,role) VALUES (?,?,?)',(data.username,hashed,role)).lastrowid
         except sqlite3.IntegrityError:
             raise HTTPException(409,'账号已存在。') from None
+        db.execute('INSERT INTO user_guides(user_id,guide_id) VALUES (?,?)',(uid,GUIDE_ID))
         event(db,uid,'register')
         user=public_user(db.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone())
     csrf=rotate(request,response,uid)
@@ -2709,6 +2784,713 @@ pause
 
 ## ③ 前端 HTML / CSS / JavaScript 完整代码
 
+### `static/robot-welcome.js`
+
+```javascript
+import {createGuideRobot} from './robot-model.js';
+
+// 首页的同一形象入口；完整引导仅在已登录工作台运行。
+const assistant=document.createElement('div');assistant.className='robot-assistant';
+const host=document.createElement('div');host.className='robot-model';
+const link=document.createElement('a');link.className='robot-launcher';link.href='/app#guide';link.setAttribute('aria-label','让小安带我开始使用职安');link.title='进入工作台，让小安带你了解职安';
+const tag=document.createElement('span');tag.className='robot-name';tag.textContent='小安 · 带你开始';assistant.append(host,link,tag);document.body.append(assistant);
+const reduced=matchMedia('(prefers-reduced-motion: reduce)'),model=createGuideRobot(host,{reducedMotion:reduced.matches});
+function dock(){const w=innerWidth<700?92:112,h=innerWidth<700?122:146;assistant.style.width=w+'px';assistant.style.height=h+'px';assistant.style.transform=`translate3d(${Math.max(8,innerWidth-w-16)}px,${Math.max(12,innerHeight-h-38)}px,0)`;model.resize();}
+function sync(){const off=document.querySelector('#visual-effects-mode')?.value==='off';model.setReducedMotion(reduced.matches||off);model.setActive(!document.hidden&&!off);}
+window.addEventListener('resize',dock,{passive:true});document.addEventListener('visibilitychange',sync);reduced.addEventListener('change',sync);
+document.addEventListener('change',e=>{if(e.target.id==='visual-effects-mode')sync();});window.addEventListener('pagehide',()=>model.setActive(false));window.addEventListener('pageshow',sync);dock();sync();
+```
+
+### `static/guide-core.js`
+
+```javascript
+/* 固定引导内容与纯视口布局，无账号资料或业务执行。 */
+(function(root,factory){const api=factory();if(typeof module==='object'&&module.exports)module.exports=api;else root.CareerGuideCore=api;})(typeof window==='undefined'?this:window,function(){
+  'use strict';
+  const STEPS=[
+    {view:'overview',target:'#view-overview [data-go="materials"]',title:'你好，我是小安',body:'我会陪你认识职安。点击这里，从一份求职材料开始安全体检。准备好后点“我明白了”。'},
+    {view:'materials',target:'#dropzone',title:'先读懂你的材料',body:'在这里上传简历、招聘截图或 PDF，也可以粘贴文字。识别后请核对低置信度内容。'},
+    {view:'risk',target:'.risk-score-panel',title:'看清招聘风险',body:'选择招聘材料后查看风险线索与原文依据。分数反映话术风险，不是诈骗概率。'},
+    {view:'privacy',target:'#privacy-select',title:'投递前，守住隐私',body:'选择简历检查敏感字段，对比脱敏前后，确认无误再导出投递版本。'},
+    {view:'career',target:'#jd-text',title:'把岗位要求变成计划',body:'选择简历并填写岗位要求，生成能力差距、四周学习计划与有依据的建议。'},
+    {view:'tree',target:'#tree-config summary',title:'点亮你的职业星图',body:'填写专业与目标，由 AI 生成共享技能路径。拖拽、缩放或点击节点，查看学习任务。'},
+    {view:'exam',target:'#view-exam [data-go="tree"]',title:'用考核检验掌握程度',body:'先从技能树选择节点出题。完成考核解锁后续技能，错题会进入个人错题本。'},
+    {view:'interview',target:'#interview-occupation',title:'练习，把经历说清楚',body:'填写岗位后与 AI 面试官逐轮对话。语音与镜头由你选择开启，也能直接文字回答。'},
+    {view:'jobs',target:'#job-search',title:'发现适合自己的机会',body:'在这里搜索推荐岗位、查看点评。你也能提交岗位信息，审核通过后公开展示。'},
+    {view:'profile',target:'#profile-occupation',title:'最后，设定你的目标',body:'在个人中心设置目标职业与简历，查看考试、面试和错题记录。以后点右侧的我，可以重看引导。'},
+  ];
+  const clamp=(n,a,b)=>Math.max(a,Math.min(n,b));
+  function place(rect,{width,height},{bubbleHeight=218}={}){
+    const margin=12,small=width<700,rw=small?96:150,rh=small?132:196,gap=small?8:14;
+    const bw=Math.min(320,Math.max(120,width-margin*2-rw-gap)),bh=Math.min(bubbleHeight,height-margin*2),gw=bw+gap+rw,gh=Math.max(rh,bh);
+    const left=clamp(rect.left,margin,width-margin),right=clamp(rect.right,margin,width-margin),top=clamp(rect.top,margin,height-margin),bottom=clamp(rect.bottom,margin,height-margin);
+    const aim={x:(left+right)/2,y:(top+bottom)/2};
+    const candidates=[{x:aim.x-gw/2,y:bottom+22},{x:aim.x-gw/2,y:top-gh-22},{x:right+22,y:aim.y-gh/2},{x:left-gw-22,y:aim.y-gh/2}];
+    const fit=candidates.find(c=>c.x>=margin&&c.x+gw<=width-margin&&c.y>=margin&&c.y+gh<=height-margin);
+    const base=fit||candidates.find(c=>c.y>=margin&&c.y+gh<=height-margin)||candidates[0];
+    const x=clamp(base.x,margin,Math.max(margin,width-gw-margin)),y=clamp(base.y,margin,Math.max(margin,height-gh-margin));
+    return {robot:{x:x+bw+gap,y:y+gh-rh,width:rw,height:rh},bubble:{x,y,width:bw,height:bh},aim,
+      highlight:{x:left-5,y:top-5,width:Math.max(10,right-left+10),height:Math.max(10,bottom-top+10)}};
+  }
+  function createGate(){
+    let version=0,active=false;
+    return {get version(){return version;},get active(){return active;},begin(){return ++version;},
+      enter(token){if(active||token!==version)return false;active=true;version++;return true;},
+      close(){active=false;version++;}};
+  }
+  return {STEPS,place,createGate};
+});
+```
+
+### `static/guide-assistant.js`
+
+```javascript
+import {createGuideRobot} from './robot-model.js';
+
+// 机器人只介绍界面，不执行分析、上传、考试或媒体权限请求。
+const core=window.CareerGuideCore;
+if(core){
+  const reduced=matchMedia('(prefers-reduced-motion: reduce)');
+  const make=(tag,cls,text='')=>{const e=document.createElement(tag);e.className=cls;e.textContent=text;return e;};
+  const assistant=make('div','robot-assistant'),modelHost=make('div','robot-model');
+  const launcher=make('button','robot-launcher');launcher.type='button';launcher.disabled=true;launcher.setAttribute('aria-label','让小安带我了解职安');launcher.title='重新查看新手引导';
+  const name=make('span','robot-name','小安 · 点击引导');assistant.append(modelHost,launcher,name);document.body.append(assistant);
+  const model=createGuideRobot(modelHost,{reducedMotion:reduced.matches});
+  const overlay=make('div','robot-tour-backdrop'),highlight=make('div','robot-tour-highlight'),bubble=make('section','robot-bubble');
+  overlay.hidden=highlight.hidden=bubble.hidden=true;
+  highlight.setAttribute('aria-hidden','true');bubble.setAttribute('role','dialog');bubble.setAttribute('aria-modal','true');bubble.setAttribute('aria-labelledby','robot-guide-title');bubble.setAttribute('aria-describedby','robot-guide-body');
+  const progress=make('p','robot-guide-progress'),title=make('h2','robot-guide-title'),description=make('p','robot-guide-body'),message=make('p','robot-guide-message');
+  title.id='robot-guide-title';description.id='robot-guide-body';message.setAttribute('role','status');message.setAttribute('aria-live','polite');
+  const controls=make('div','robot-guide-controls'),previous=make('button','robot-guide-prev','上一步'),skip=make('button','robot-guide-skip','跳过引导'),next=make('button','robot-guide-next','我明白了');
+  [previous,skip,next].forEach(b=>b.type='button');controls.append(previous,skip,next);bubble.append(progress,title,description,message,controls);document.body.append(overlay,highlight,bubble);
+  let active=false,index=0,busy=false,initialized=false,oldOverflow='',oldFocus=null,target=null,frame=0,aim=null;
+  const gate=core.createGate();
+  const inerted=new Map();
+  const request=(data,keepalive=false)=>window.api('/onboarding',data?{method:'POST',data,keepalive}:{});
+  const clamp=(n,a,b)=>Math.max(a,Math.min(n,b));
+  function syncMotion(){
+    const off=document.querySelector('#visual-effects-mode')?.value==='off';
+    model.setReducedMotion(reduced.matches||off);model.setActive(!document.hidden&&!off);
+  }
+  function setBusy(value){busy=value;previous.disabled=next.disabled=value;next.setAttribute('aria-busy',String(value));}
+  function moveHost(x,y,width,height){
+    assistant.style.width=width+'px';assistant.style.height=height+'px';assistant.style.transform=`translate3d(${x}px,${y}px,0)`;model.resize();
+  }
+  function dock(){
+    if(active)return;
+    const w=innerWidth<700?92:112,h=innerWidth<700?122:146;
+    let y=innerHeight-h-38;
+    const camera=document.querySelector('#camera-mini');
+    if(camera&&!camera.hidden&&camera.getBoundingClientRect().width&&camera.closest('.view')?.hidden===false)y=Math.min(y,camera.getBoundingClientRect().top-h-12);
+    moveHost(Math.max(8,innerWidth-w-16),Math.max(12,y),w,h);model.setPointing(false);
+  }
+  function position(){
+    frame=0;if(!active||!target?.isConnected)return;
+    const rect=target.getBoundingClientRect();
+    const first=core.place(rect,{width:innerWidth,height:innerHeight});
+    bubble.style.width=first.bubble.width+'px';
+    const layout=core.place(rect,{width:innerWidth,height:innerHeight},{bubbleHeight:bubble.offsetHeight||218});
+    bubble.style.transform=`translate3d(${layout.bubble.x}px,${layout.bubble.y}px,0)`;
+    bubble.style.maxHeight=(innerHeight-24)+'px';
+    const r=layout.highlight;highlight.style.transform=`translate3d(${r.x}px,${r.y}px,0)`;highlight.style.width=r.width+'px';highlight.style.height=r.height+'px';
+    moveHost(layout.robot.x,layout.robot.y,layout.robot.width,layout.robot.height);aim=layout.aim;model.setPointing(true);model.pointAt(aim.x,aim.y);
+  }
+  const schedule=()=>{if(!frame)frame=requestAnimationFrame(active?position:()=>{frame=0;dock();});};
+  assistant.addEventListener('transitionend',e=>{if(active&&e.propertyName==='transform'&&aim)model.pointAt(aim.x,aim.y);});
+  function showStep(){
+    const step=core.STEPS[index];if(!step)return;
+    window.show(step.view);
+    target=document.querySelector(step.target)||document.querySelector('#view-'+step.view+' .page-heading');
+    progress.textContent=`小安的使用指南 · ${index+1} / ${core.STEPS.length}`;title.textContent=step.title;description.textContent=step.body;message.textContent='';previous.hidden=index===0;
+    if(target){target.scrollIntoView({block:innerWidth<700?'start':'center',behavior:'instant'});position();}
+    else {message.textContent='这个区域暂未就绪，可以跳过这一步。';target=document.querySelector('#main');position();}
+    next.focus({preventScroll:true});schedule();
+  }
+  function maskBackground(){
+    for(const el of document.body.children){
+      if(el===assistant||el===overlay||el===highlight||el===bubble||el.tagName==='SCRIPT'||el.tagName==='SVG'||el.classList.contains('fx-cosmos'))continue;
+      inerted.set(el,el.inert);el.inert=true;
+    }
+  }
+  function open(step,token){
+    if(!gate.enter(token))return;
+    active=true;index=clamp(step,0,core.STEPS.length-1);oldFocus=document.activeElement;oldOverflow=document.body.style.overflow;document.body.style.overflow='hidden';
+    assistant.classList.add('is-guiding');launcher.hidden=name.hidden=true;overlay.hidden=highlight.hidden=bubble.hidden=false;maskBackground();setBusy(false);showStep();
+  }
+  function close(){
+    if(!active)return;gate.close();active=false;target=null;aim=null;cancelAnimationFrame(frame);frame=0;
+    overlay.hidden=highlight.hidden=bubble.hidden=true;assistant.classList.remove('is-guiding');launcher.hidden=name.hidden=false;document.body.style.overflow=oldOverflow;
+    inerted.forEach((value,el)=>{if(el.isConnected)el.inert=value;});inerted.clear();model.setPointing(false);setBusy(false);dock();
+    const focus=oldFocus?.isConnected&&oldFocus!==document.body?oldFocus:launcher;focus.focus?.({preventScroll:true});
+  }
+  async function begin(){
+    if(active||launcher.disabled)return;
+    const token=gate.begin();
+    launcher.disabled=true;
+    try{const result=await request({action:'start',step:0});open(result.step,token);}
+    catch{if(typeof window.toast==='function')window.toast('暂时无法开启引导，请稍后重试。',true);}
+    finally{launcher.disabled=false;}
+  }
+  async function advance(direction){
+    if(busy||!active)return;
+    const token=gate.version,wanted=index+direction,done=wanted>=core.STEPS.length;setBusy(true);message.textContent='';
+    try{
+      await request({action:done?'complete':'progress',step:done?index:wanted});
+      if(token!==gate.version||!active)return;
+      if(done){close();if(typeof window.toast==='function')window.toast('使用指南已完成。接下来，按你的节奏开始。');}
+      else{index=wanted;setBusy(false);showStep();}
+    }catch{if(token===gate.version&&active){message.textContent='进度暂未保存，请再试一次；也可以跳过引导。';setBusy(false);schedule();}}
+  }
+  async function skipGuide(){
+    if(!active)return;
+    const step=index;close();launcher.disabled=true;
+    try{await request({action:'skip',step},true);}
+    catch{if(typeof window.toast==='function')window.toast('引导已关闭，进度暂未保存。',true);}
+    finally{launcher.disabled=false;}
+  }
+  launcher.addEventListener('click',begin);previous.addEventListener('click',()=>advance(-1));next.addEventListener('click',()=>advance(1));skip.addEventListener('click',skipGuide);
+  document.addEventListener('keydown',e=>{
+    if(!active)return;
+    if(e.key==='Escape'){e.preventDefault();skipGuide();}
+    if(e.key==='Tab'){
+      const buttons=[previous,skip,next].filter(b=>!b.hidden&&!b.disabled);
+      const current=buttons.indexOf(document.activeElement);e.preventDefault();buttons[(current+(e.shiftKey?-1:1)+buttons.length)%buttons.length]?.focus();
+    }
+  });
+  window.addEventListener('resize',schedule,{passive:true});window.addEventListener('scroll',()=>{if(active)schedule();},{passive:true});
+  window.addEventListener('viewchange',()=>{if(!active)schedule();});document.addEventListener('visibilitychange',syncMotion);reduced.addEventListener('change',()=>{syncMotion();schedule();});
+  document.addEventListener('change',e=>{if(e.target.id==='visual-effects-mode')syncMotion();});
+  window.addEventListener('pagehide',()=>model.setActive(false));window.addEventListener('pageshow',syncMotion);
+  async function initialize(){
+    if(initialized)return;initialized=true;launcher.disabled=false;dock();syncMotion();const token=gate.version;
+    if(location.hash==='#guide'){history.replaceState(null,'',location.pathname+location.search);begin();return;}
+    try{const status=await request();if(status.auto_start&&!active)open(status.step,token);}
+    catch{/* 机器人与手动入口保持可见，接口恢复后可重试。 */}
+  }
+  if(window.careerPlatformReady)initialize();else window.addEventListener('platform-loaded',initialize,{once:true});
+  dock();syncMotion();
+}
+```
+
+### `static/guide-assistant.css`
+
+```css
+.robot-assistant{position:fixed;left:0;top:0;width:112px;height:146px;z-index:92;pointer-events:none;transition:transform 680ms var(--ease),width 300ms var(--ease),height 300ms var(--ease);filter:drop-shadow(0 10px 14px #053d8644)}
+.robot-model{position:absolute;inset:0;pointer-events:none}.robot-model canvas{width:100%;height:100%;pointer-events:none}.robot-launcher{position:absolute;inset:0;pointer-events:auto;border:0;background:transparent;cursor:pointer;border-radius:45%;padding:0}.robot-launcher:focus-visible{outline:2px solid #a3dfff;outline-offset:3px;box-shadow:0 0 28px #58adff55}.robot-name{position:absolute;bottom:-12px;left:50%;transform:translateX(-50%);font-size:10px;white-space:nowrap;letter-spacing:.05em;color:#c4e8ff;background:#0e2138d9;border:1px solid #8bbcf26b;border-radius:999px;padding:3px 9px;pointer-events:none}
+.robot-tour-backdrop{position:fixed;inset:0;z-index:190;background:transparent;pointer-events:auto;touch-action:none}
+.robot-tour-highlight{position:fixed;left:0;top:0;z-index:191;pointer-events:none;border:2px solid #92daff;border-radius:15px;box-shadow:0 0 0 9999px #020817b8,0 0 22px #5bc2ffb3,inset 0 0 20px #80cdff16;transition:opacity 200ms var(--ease)}
+.robot-assistant.is-guiding{z-index:194;filter:drop-shadow(0 8px 18px #207fe778)}
+.robot-bubble{position:fixed;left:0;top:0;z-index:195;width:320px;margin:0;padding:20px;border:1px solid #a7dfff9c;border-radius:22px;background:linear-gradient(145deg,#183754f2,#10203bf5);color:#eff8ff;box-shadow:inset 0 1px #e2f6ff30,0 15px 60px #0009,0 0 30px #66bfff26;backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);overflow:auto;overscroll-behavior:contain;pointer-events:auto;transition:opacity 200ms var(--ease)}
+.robot-bubble::after{content:'';position:absolute;right:8px;bottom:16px;width:13px;height:13px;border-radius:0 0 5px 0;background:#16304d;transform:rotate(-45deg);pointer-events:none}
+.robot-guide-progress{font-size:10px;color:#a8d6f3;letter-spacing:.05em;margin:0 0 8px}.robot-guide-title{font-size:20px;line-height:1.4;color:#f4fbff;margin:0 0 10px;letter-spacing:-.02em}.robot-guide-body{font-size:13px;line-height:1.9;color:#cfdfef;margin:0}.robot-guide-message{font-size:11px;line-height:1.7;color:#ffd3a4;margin:9px 0 0}.robot-guide-message:empty{display:none}
+.robot-guide-controls{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-top:17px}.robot-guide-controls button{font-size:12px;min-height:36px;border-radius:999px;padding:8px 12px;line-height:1.5;cursor:pointer}.robot-guide-prev,.robot-guide-skip{background:#19324c;border:1px solid #819fbc69;color:#bfd7eb}.robot-guide-next{background:#386cf4;border:1px solid #86b4ff;color:#fff;margin-left:auto;box-shadow:0 0 18px #5383ff33}.robot-guide-controls button:focus-visible{outline:2px solid #d1f1ff;outline-offset:3px}.robot-guide-controls button:disabled{opacity:.5;cursor:wait}
+@media(hover:hover) and (pointer:fine){.robot-guide-next:hover{background:#5785ff}.robot-guide-prev:hover,.robot-guide-skip:hover{background:#2c4c70}.robot-launcher:hover{background:radial-gradient(ellipse,#63bfff15,transparent 65%)}}
+@media(max-width:700px){.robot-assistant{width:92px;height:122px}.robot-name{font-size:9px;padding:3px 7px}.robot-bubble{padding:14px;border-radius:18px}.robot-guide-title{font-size:17px;margin-bottom:8px}.robot-guide-body{font-size:12px;line-height:1.8}.robot-guide-progress{font-size:9px}.robot-guide-controls{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:12px}.robot-guide-next{grid-column:1/-1;grid-row:1;margin:0}.robot-guide-prev,.robot-guide-skip{padding:6px 4px!important;font-size:11px!important;min-height:31px!important}.robot-guide-skip{grid-column:2}.robot-guide-controls button:only-child{grid-column:1/-1}}
+@media(prefers-reduced-motion:reduce){.robot-assistant,.robot-bubble,.robot-tour-highlight{transition:none!important}}
+@media(prefers-reduced-transparency:reduce),(prefers-contrast:more){.robot-bubble{background:#112740;backdrop-filter:none;-webkit-backdrop-filter:none;border-color:#bcddff}}
+@media print{.robot-assistant,.robot-bubble,.robot-tour-backdrop,.robot-tour-highlight{display:none}}
+.skip:not(:focus),.cinema-skip:not(:focus){clip-path:inset(100%)}
+body[data-fx-mode=off] .robot-assistant,body[data-fx-mode=off] .robot-bubble{transition:none}
+```
+
+### `static/robot-model.js`
+
+```javascript
+import * as THREE from './vendor/three/three.module.js';
+
+/** Small, self-contained guide character. Coordinates passed to pointAt are viewport pixels. */
+export function createGuideRobot(host, { reducedMotion = false } = {}) {
+  const fallbackURL = new URL('./assets/robot-reference.webp', import.meta.url).href;
+  let active = true, disposed = false, failed = false, pointing = false;
+  let frame = 0, lastFrame = -Infinity, renderer, fallback, observer;
+  let targetX = 0, targetY = 0, hasTarget = false;
+  let poseAngle = 0, poseSide = -1;
+  const geometries = new Set(), materials = new Set();
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 30);
+  camera.position.set(0, 0.23, 7.2);
+  camera.lookAt(0, 0.22, 0);
+  const robot = new THREE.Group();
+  scene.add(robot);
+  const rememberMaterial = material => (materials.add(material), material);
+  const white = rememberMaterial(new THREE.MeshPhysicalMaterial({ color: 0xf7fbff, roughness: 0.19, metalness: 0.05, clearcoat: 1, clearcoatRoughness: 0.12 }));
+  const edgeWhite = rememberMaterial(new THREE.MeshPhysicalMaterial({ color: 0xe0edf2, roughness: 0.25, metalness: 0.12, clearcoat: 0.85 }));
+  const black = rememberMaterial(new THREE.MeshPhysicalMaterial({ color: 0x02070c, roughness: 0.2, metalness: 0.08, clearcoat: 1 }));
+  const cyan = rememberMaterial(new THREE.MeshBasicMaterial({ color: 0x08aaff, toneMapped: false }));
+  function mesh(geometry, material, parent = robot) {
+    geometries.add(geometry);
+    const result = new THREE.Mesh(geometry, material);
+    parent.add(result);
+    return result;
+  }
+  const bodyProfile = [
+    [0, -1.22], [0.14, -1.19], [0.29, -1.06], [0.41, -0.82],
+    [0.51, -0.5], [0.59, -0.12], [0.63, 0.2], [0.63, 0.37],
+    [0.59, 0.43], [0.47, 0.46], [0.3, 0.44], [0, 0.42],
+  ].map(([x, y]) => new THREE.Vector2(x, y));
+  mesh(new THREE.LatheGeometry(bodyProfile, 64), white).scale.z = 0.78;
+  const neck = mesh(new THREE.SphereGeometry(0.4, 40, 24), edgeWhite);
+  neck.position.y = 0.45;
+  neck.scale.set(1, 0.25, 0.8);
+  const head = new THREE.Group();
+  head.position.y = 1.08;
+  robot.add(head);
+  const shell = mesh(new THREE.SphereGeometry(1, 64, 48), white, head);
+  shell.scale.set(0.76, 0.68, 0.61);
+  // An oval patch follows the actual head curvature; no flat plate or box visor.
+  const vertices = [0, -0.025, 0.628], indices = [];
+  const rings = 12, segments = 64;
+  for (let ring = 1; ring <= rings; ring++) {
+    const radius = ring / rings;
+    for (let i = 0; i < segments; i++) {
+      const angle = i / segments * Math.PI * 2;
+      const x = 0.605 * radius * Math.cos(angle);
+      const y = 0.415 * radius * Math.sin(angle) - 0.025;
+      const z = 0.61 * Math.sqrt(Math.max(0, 1 - (x / 0.76) ** 2 - (y / 0.68) ** 2)) + 0.018;
+      vertices.push(x, y, z);
+      if (ring === 1) indices.push(0, 1 + i, 1 + (i + 1) % segments);
+      else {
+        const a = 1 + (ring - 2) * segments + i;
+        const b = 1 + (ring - 2) * segments + (i + 1) % segments;
+        const c = 1 + (ring - 1) * segments + i;
+        const d = 1 + (ring - 1) * segments + (i + 1) % segments;
+        indices.push(a, c, d, a, d, b);
+      }
+    }
+  }
+  const visor = new THREE.BufferGeometry();
+  visor.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+  visor.setIndex(indices);
+  visor.computeVertexNormals();
+  mesh(visor, black, head);
+  for (const side of [-1, 1]) {
+    const eye = mesh(new THREE.SphereGeometry(1, 32, 24), cyan, head);
+    eye.scale.set(0.14, 0.095, 0.035);
+    eye.position.set(side * 0.23, 0.015, 0.607);
+    eye.rotation.y = side * 0.22;
+  }
+  const arms = [];
+  for (const side of [-1, 1]) {
+    const pivot = new THREE.Group();
+    pivot.position.set(side * 0.62, 0.26, 0.025);
+    robot.add(pivot);
+    const joint = mesh(new THREE.SphereGeometry(0.15, 24, 16), edgeWhite, pivot);
+    joint.scale.set(0.85, 1, 0.9);
+    const profile = [[0, 0.09], [0.11, 0.05], [0.18, -0.1], [0.19, -0.34], [0.16, -0.67], [0.11, -0.94], [0.045, -1.1], [0, -1.13]].reverse().map(([x, y]) => new THREE.Vector2(x, y));
+    const flipper = mesh(new THREE.LatheGeometry(profile, 40), white, pivot);
+    flipper.scale.z = 0.58;
+    flipper.position.x = side * 0.04;
+    pivot.rotation.z = side * 0.12;
+    arms.push(pivot);
+  }
+  scene.add(new THREE.HemisphereLight(0xe8f7ff, 0x75808c, 3));
+  const key = new THREE.DirectionalLight(0xffffff, 4.1);
+  key.position.set(-3, 5, 5); scene.add(key);
+  const rim = new THREE.DirectionalLight(0xa9e3ff, 2.7);
+  rim.position.set(4, 2, -3); scene.add(rim);
+
+  function showFallback() {
+    if (disposed || failed) return;
+    failed = true;
+    cancelAnimationFrame(frame); frame = 0;
+    if (renderer) renderer.domElement.style.display = 'none';
+    fallback = document.createElement('img');
+    fallback.src = fallbackURL;
+    fallback.alt = '';
+    fallback.setAttribute('aria-hidden', 'true');
+    Object.assign(fallback.style, { width: '100%', height: '100%', objectFit: 'contain', display: 'block', pointerEvents: 'none', borderRadius: '35%' });
+    host.appendChild(fallback);
+  }
+  function updateDirection() {
+    if (!hasTarget) return;
+    const bounds = host.getBoundingClientRect();
+    const dx = targetX - (bounds.left + bounds.width / 2);
+    const dy = targetY - (bounds.top + bounds.height / 2);
+    poseSide = dx < 0 ? -1 : 1;
+    poseAngle = Math.min(2.65, Math.max(0.45, Math.atan2(Math.abs(dx), dy)));
+  }
+  function applyPose(time, immediate = false) {
+    if (pointing) updateDirection();
+    const selected = pointing ? poseAngle : 0.12;
+    const lerp = reducedMotion || immediate ? 1 : 0.22;
+    arms.forEach((arm, index) => {
+      const side = index === 0 ? -1 : 1;
+      const angle = side * (side === poseSide ? selected : 0.12);
+      arm.rotation.z += (angle - arm.rotation.z) * lerp;
+      arm.rotation.x = pointing && side === poseSide ? -0.12 : 0;
+    });
+    const yaw = pointing ? poseSide * 0.1 : -0.08;
+    robot.rotation.y += (yaw - robot.rotation.y) * lerp;
+    robot.position.y = reducedMotion ? 0 : Math.sin(time * 0.0014) * 0.045;
+    head.rotation.z = reducedMotion ? 0 : Math.sin(time * 0.0008) * 0.015;
+  }
+  function render(time, immediate = false) {
+    if (disposed || failed || !renderer) return;
+    applyPose(time, immediate);
+    try { renderer.render(scene, camera); } catch { showFallback(); }
+  }
+  function animate(time) {
+    frame = 0;
+    if (!active || disposed || failed || document.hidden) return;
+    if (time - lastFrame >= 1000 / 30) { lastFrame = time; render(time); }
+    if (!reducedMotion && !failed) frame = requestAnimationFrame(animate);
+  }
+  function wake(immediate = false) {
+    if (!active || disposed || failed || document.hidden) return;
+    if (reducedMotion || immediate) render(performance.now(), true);
+    if (!reducedMotion && !frame) frame = requestAnimationFrame(animate);
+  }
+  function resize() {
+    if (disposed) return;
+    updateDirection();
+    const rect = host.getBoundingClientRect();
+    if (renderer && !failed && rect.width > 0 && rect.height > 0) {
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setSize(rect.width, rect.height, false);
+      camera.aspect = rect.width / rect.height;
+      camera.updateProjectionMatrix();
+      if (!document.hidden) render(performance.now(), reducedMotion || !active);
+      wake();
+    }
+  }
+  function visibilityChange() {
+    if (document.hidden) { cancelAnimationFrame(frame); frame = 0; } else wake(true);
+  }
+  function contextLost(event) { event.preventDefault(); showFallback(); }
+  try {
+    renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, powerPreference: 'low-power' });
+    renderer.setClearColor(0x000000, 0);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.12;
+    renderer.domElement.setAttribute('aria-hidden', 'true');
+    Object.assign(renderer.domElement.style, { display: 'block', width: '100%', height: '100%', pointerEvents: 'none' });
+    renderer.domElement.addEventListener('webglcontextlost', contextLost);
+    host.appendChild(renderer.domElement);
+  } catch { showFallback(); }
+  document.addEventListener('visibilitychange', visibilityChange);
+  window.addEventListener('resize', resize);
+  if (typeof ResizeObserver !== 'undefined') { observer = new ResizeObserver(resize); observer.observe(host); }
+  resize();
+  return {
+    pointAt(x, y) {
+      if (disposed || !Number.isFinite(x) || !Number.isFinite(y)) return;
+      targetX = x; targetY = y; hasTarget = true; updateDirection();
+      if (!document.hidden) render(performance.now(), reducedMotion || !active);
+      wake();
+    },
+    setPointing(value) {
+      pointing = Boolean(value);
+      if (!document.hidden) render(performance.now(), reducedMotion || !active);
+      wake();
+    },
+    setReducedMotion(value) {
+      reducedMotion = Boolean(value);
+      cancelAnimationFrame(frame); frame = 0;
+      if (!document.hidden) render(performance.now(), reducedMotion || !active);
+      wake();
+    },
+    setActive(value) {
+      active = Boolean(value);
+      if (active) wake(true); else { cancelAnimationFrame(frame); frame = 0; }
+    },
+    resize,
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      cancelAnimationFrame(frame);
+      observer?.disconnect();
+      document.removeEventListener('visibilitychange', visibilityChange);
+      window.removeEventListener('resize', resize);
+      for (const geometry of geometries) geometry.dispose();
+      for (const material of materials) material.dispose();
+      if (renderer) {
+        renderer.domElement.removeEventListener('webglcontextlost', contextLost);
+        renderer.dispose();
+        renderer.domElement.remove();
+      }
+      fallback?.remove();
+      scene.clear();
+    },
+  };
+}
+```
+
+### `static/effects.css`
+
+```css
+/* 用户要求的全开视觉层；所有连续动画支持暂停、轻量及关闭。 */
+body{isolation:isolate;background:#030611}
+.fx-cosmos{position:fixed;inset:0;overflow:hidden;z-index:0;pointer-events:none;background:radial-gradient(ellipse at 72% 28%,#13264c6e,transparent 65%),#040713;contain:strict}
+.fx-canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;opacity:.86}
+.fx-aurora{position:absolute;width:85vw;height:78vh;border-radius:50%;opacity:.45;pointer-events:none;background:radial-gradient(ellipse,#2860f435,transparent 68%);animation:fx-drift 22s ease-in-out infinite alternate}
+.fx-aurora.blue{left:-25%;top:-20%}.fx-aurora.violet{right:-25%;top:20%;background:radial-gradient(ellipse,#8c3bfa32,transparent 66%);animation-delay:-8s;animation-duration:27s}.fx-aurora.cyan{left:10%;bottom:-40%;background:radial-gradient(ellipse,#1cb8d527,transparent 68%);animation-delay:-13s;animation-duration:24s}
+.shell,body.star-theme .shell{background:transparent;position:relative;z-index:1}.landing-main,.auth-main,.demo-main,.site-footer,.admin-shell{position:relative;z-index:1}.site-header{z-index:30}.sidebar,body.star-theme .sidebar,.admin-sidebar{background:linear-gradient(135deg,#18324a75,#0b1420a3);backdrop-filter:blur(24px) saturate(150%);-webkit-backdrop-filter:blur(24px) saturate(150%);border-color:#83c8ff40}
+.topbar,body.star-theme .topbar,.admin-top,.site-header{background:linear-gradient(115deg,#223d585e,#0e182d85);backdrop-filter:blur(24px) saturate(160%);-webkit-backdrop-filter:blur(24px) saturate(160%);border-color:#85c9ff46;box-shadow:inset 0 1px #c1e9ff1a,0 4px 28px #1c68c412}
+.fx-card{position:relative;isolation:isolate;background:linear-gradient(135deg,#233d584d,#101b2e6b 48%,#18234155)!important;border-color:#8cc9ff52!important;backdrop-filter:blur(18px) saturate(145%);-webkit-backdrop-filter:blur(18px) saturate(145%);box-shadow:inset 0 1px #d6efff21,0 0 24px #4c94f718,0 0 48px #864aff10!important}
+.fx-card:focus-within{border-color:#9fcfffaa!important;box-shadow:inset 0 1px #e2f5ff30,0 0 23px #5b9efa35,0 0 48px #864aff20!important}
+.fx-edge{position:absolute;inset:-1px;border-radius:inherit;overflow:hidden;padding:1.5px;pointer-events:none;z-index:5;-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);mask-composite:exclude;opacity:.9}
+.fx-edge::before{content:'';position:absolute;inset:-50%;background:conic-gradient(from 0deg,transparent 0deg,#7ce6ff 45deg,transparent 80deg,transparent 140deg,#bb98ff 190deg,transparent 225deg,#689dff 275deg,transparent 330deg);animation:fx-edge-orbit 9s linear infinite}
+.fx-card:nth-child(3n) .fx-edge::before{animation-delay:-3s;animation-duration:12s}.fx-card:nth-child(3n+1) .fx-edge::before{animation-delay:-6s}
+.fx-card:not(.fx-visible) .fx-edge::before{animation-play-state:paused}
+.fx-spot{position:absolute;inset:0;border-radius:inherit;overflow:hidden;pointer-events:none;opacity:0;z-index:-1;transition:opacity 180ms var(--ease)}.fx-spot-light{position:absolute;left:0;top:0;width:280px;height:280px;background:radial-gradient(circle,#8bd8ff26,transparent 67%);border-radius:50%;pointer-events:none}
+.fx-press{position:relative;overflow:hidden}.fx-ripple{position:absolute;width:140px;height:140px;margin:-70px;border-radius:50%;background:radial-gradient(circle,#d2ecff6b,transparent 70%);pointer-events:none;z-index:7;animation:fx-ripple-out 650ms var(--ease) forwards}
+.fx-toolbar{display:inline-flex;align-items:center;gap:5px;font-size:10px;color:#bdd3f6;white-space:nowrap;margin-left:8px;position:relative;z-index:10}
+.fx-toolbar select{width:auto!important;min-width:65px;min-height:32px;padding:5px 20px 5px 10px!important;border:1px solid #80b6f564!important;border-radius:999px!important;background:#11223b85!important;box-shadow:0 0 15px #4e93f51f;color:#d8e9ff!important;font-size:11px!important;cursor:pointer}.fx-toolbar option{background:#101c31;color:#e3eeff}
+.fx-glass-icon{fill:none!important;stroke:none!important;overflow:hidden;mix-blend-mode:screen;flex-shrink:0;filter:drop-shadow(0 0 5px #70baff3d);width:27px;height:27px;transition:transform 200ms var(--ease),filter 200ms}
+.fx-glass-icon image{pointer-events:none}.nav-item .fx-glass-icon{width:30px;height:30px}.sidebar .nav-item,body.star-theme .sidebar .nav-item{min-height:50px;padding-top:10px;padding-bottom:10px;gap:10px}.nav-item.active .fx-glass-icon{filter:drop-shadow(0 0 8px #72c9ff78)}
+.brand-mark{width:44px;height:48px}.brand-mark .fx-glass-icon{width:45px;height:45px}.site-brand>.fx-glass-icon{width:39px;height:42px}.site-mark .fx-glass-icon{width:37px;height:37px}.metric-icon{width:36px;height:36px;display:grid;place-items:center;background:transparent!important}.metric-icon .fx-glass-icon{width:34px;height:34px}.route-icon{width:43px;height:43px;background:#1d3a5d50!important}.route-icon .fx-glass-icon{width:36px;height:36px}.button .fx-glass-icon,.pill .fx-glass-icon{width:23px;height:23px}.upload-circle .fx-glass-icon{width:45px;height:45px}.model-logo .fx-glass-icon{width:35px;height:35px}.model-logo{width:40px;height:40px;background:#1c345a55!important;border-color:#6c9bd653}
+.star-orb>.fx-glass-icon{width:85%;height:85%;filter:drop-shadow(0 0 5px #7bc9ff66)}.star-node.student .fx-glass-icon{width:90%;height:90%}.star-detail-icon>.fx-glass-icon{width:90%;height:90%}.star-viewport.tree-scroll{background-color:#07112566!important}.star-map-top,.star-map-bottom,.star-stage-list{background:#13213b85!important;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+.overview-hero-art,.cinema-hero-art{animation:fx-float 7s ease-in-out infinite alternate}.overview-feature-art{animation:fx-icon-float 6s ease-in-out infinite alternate}.overview-feature:nth-child(2) .overview-feature-art{animation-delay:-3s}
+.spectrum-text{background-size:200% 100%;animation:fx-spectrum 7s ease-in-out infinite alternate}.cinema-hero h1,.overview-hero h1{text-shadow:0 0 35px #86adff1f}.star-progress-track i{box-shadow:0 0 14px #859fff99}
+body[data-fx-mode=lite] .fx-edge{opacity:.55}body[data-fx-mode=lite] .fx-aurora{opacity:.25}body[data-fx-mode=lite] .overview-feature-art,body[data-fx-mode=lite] .overview-hero-art,body[data-fx-mode=lite] .cinema-hero-art{animation:none}
+body.fx-paused .fx-aurora,body.fx-paused .fx-edge::before,body.fx-paused .overview-hero-art,body.fx-paused .cinema-hero-art,body.fx-paused .overview-feature-art,body.fx-paused .spectrum-text,body.fx-paused .fx-ripple{animation-play-state:paused!important}body[data-fx-mode=off] .fx-edge,body[data-fx-mode=off] .fx-spot,body[data-fx-mode=off] .fx-ripple{display:none}body[data-fx-mode=off] .fx-card{box-shadow:inset 0 1px #cceaff16!important}body[data-fx-mode=off] .fx-card,body[data-fx-mode=off] .sidebar{backdrop-filter:none;-webkit-backdrop-filter:none}
+@keyframes fx-edge-orbit{to{transform:rotate(360deg)}}@keyframes fx-drift{from{transform:translate3d(-3%,-4%,0) scale(.94)}to{transform:translate3d(9%,8%,0) scale(1.1)}}@keyframes fx-float{from{translate:0 -4px}to{translate:0 7px}}@keyframes fx-icon-float{from{transform:translateY(-4px)}to{transform:translateY(5px)}}@keyframes fx-spectrum{from{background-position:0 50%}to{background-position:100% 50%}}@keyframes fx-ripple-out{from{transform:scale(.25);opacity:.85}to{transform:scale(3);opacity:0}}
+@media(hover:hover) and (pointer:fine){.fx-card:hover{box-shadow:inset 0 1px #e0f4ff38,0 0 28px #59b6f93b,0 0 60px #a56bff21!important}.fx-card:hover>.fx-spot{opacity:1}.nav-item:hover .fx-glass-icon,.button:hover .fx-glass-icon{transform:translateY(-1px) scale(1.08)}.fx-card:hover>.fx-edge{opacity:1}.fx-toolbar select:hover{border-color:#b1d7ff!important}}
+@media(max-width:700px){.fx-toolbar{font-size:0;margin-left:0;gap:0}.fx-toolbar select{font-size:12px!important;min-width:60px;min-height:35px;padding:5px 8px!important}.site-nav{gap:8px}.site-nav .pill{padding:9px 10px}.site-header{padding:12px}.site-brand{font-size:20px}.site-brand>.fx-glass-icon{width:32px;height:35px}.site-brand small{font-size:5px}.nav-item .fx-glass-icon{width:28px;height:28px}.sidebar .nav-item,body.star-theme .sidebar .nav-item{min-height:44px;padding:8px 10px}.fx-card{backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}.fx-aurora{width:130vw;height:75vh}.top-actions{gap:8px}.top-actions .button{font-size:10px}.fx-toolbar select:focus{font-size:16px!important}}
+@media(prefers-reduced-motion:reduce){.fx-aurora,.fx-edge::before,.overview-hero-art,.cinema-hero-art,.overview-feature-art,.spectrum-text{animation:none!important}.fx-card,.fx-glass-icon,.fx-spot{transition:none!important}.fx-ripple,.fx-spot{display:none}.fx-card:hover .fx-glass-icon,.nav-item:hover .fx-glass-icon,.button:hover .fx-glass-icon{transform:none}}
+@media(prefers-reduced-transparency:reduce),(prefers-contrast:more){.fx-card,.sidebar,body.star-theme .sidebar,.site-header,.topbar,.admin-top{background:#10213a!important;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;border-color:#9dbbe4!important}.fx-canvas,.fx-aurora{opacity:.3}}
+@media print{.fx-cosmos,.fx-toolbar,.fx-edge,.fx-spot{display:none}.fx-card{background:#fff!important;color:#000!important;box-shadow:none!important}}
+.fx-icon-defs{position:absolute;width:0;height:0;overflow:hidden;pointer-events:none}
+body[data-fx-mode=off] [data-tilt]{transform:none!important;translate:none!important}
+
+body[data-fx-mode=off] .star-energy{display:none}
+.star-detail-symbol>.fx-glass-icon{width:90%;height:90%}
+@media(min-width:1001px){.fx-card.star-panel{position:sticky;top:18px}}
+.avatar .fx-glass-icon,.top-avatar .fx-glass-icon{width:26px;height:26px}.icon-button .fx-glass-icon{width:24px;height:24px}.voice-orb .fx-glass-icon{width:64px;height:64px}.camera-placeholder>span>.fx-glass-icon{width:48px;height:48px}.star-career-item>span>.fx-glass-icon{width:30px;height:30px}
+```
+
+### `static/effects-core.js`
+
+```javascript
+/* 有预算的视觉核心；无DOM、网络或用户数据依赖，浏览器/Node共用。 */
+(function(root,factory){
+  const api=factory();
+  if(typeof module==='object'&&module.exports)module.exports=api;
+  else root.CareerFXCore=api;
+})(typeof window==='undefined'?this:window,function(){
+  'use strict';
+  function budget(width,mode='full',reduced=false){
+    const small=width<700,lite=mode==='lite',off=mode==='off';
+    return {particles:off?0:reduced?24:small?(lite?18:38):(lite?38:92),links:off?0:small?16:lite?32:90,
+      meteors:off||reduced?0:small?2:lite?2:8,fps:off||reduced?0:small?24:lite?20:30,dpr:lite?1:1.5};
+  }
+  function createField(width,height,count,random=Math.random){
+    return Array.from({length:count},()=>({x:random()*width,y:random()*height,vx:(random()-.5)*15,vy:(random()-.5)*11,r:.6+random()*1.6,phase:random()*Math.PI*2,hue:random()>.5?192:244}));
+  }
+  function stepField(points,dt,width,height){
+    const delta=Math.max(0,Math.min(.05,dt));
+    points.forEach(p=>{p.x=(p.x+p.vx*delta+width)%width;p.y=(p.y+p.vy*delta+height)%height;});
+  }
+  function nearLinks(points,distance,limit){
+    if(limit<=0)return [];
+    const out=[],max=distance*distance;
+    for(let a=0;a<points.length;a++)for(let b=a+1;b<points.length;b++){
+      const dx=points[a].x-points[b].x,dy=points[a].y-points[b].y;
+      if(dx*dx+dy*dy<max){out.push([a,b,Math.sqrt(dx*dx+dy*dy)/distance]);if(out.length>=limit)return out;}
+    }
+    return out;
+  }
+  function makeMeteor(width,height,random=Math.random){
+    const speed=300+random()*250;
+    return {x:width*(.2+random()*1.1),y:-30-random()*height*.22,vx:-speed,vy:speed*.62,length:90+random()*180,age:0,life:1.1+random()*1.5,hue:random()>.55?195:245};
+  }
+  function advanceMeteors(meteors,dt,width,height){
+    return meteors.filter(m=>{m.age+=dt;m.x+=m.vx*dt;m.y+=m.vy*dt;return m.age<m.life&&m.x>-m.length&&m.y<height+m.length;});
+  }
+  function createLoop({request,cancel,draw,interval=33}){
+    let active=false,dead=false,id=null,last=null,epoch=0;
+    const schedule=()=>{
+      if(!active||dead||id!==null)return;
+      const generation=epoch;
+      id=request(stamp=>{
+        if(generation!==epoch||!active||dead)return;
+        id=null;
+        if(last===null||stamp-last>=interval){const dt=last===null?0:Math.min(.05,(stamp-last)/1000);last=stamp;draw(dt,stamp);}
+        schedule();
+      });
+    };
+    return {setActive(next){
+      if(dead||active===Boolean(next))return;
+      active=Boolean(next);epoch++;last=null;
+      if(id!==null){cancel(id);id=null;}
+      if(active)schedule();
+    },dispose(){active=false;dead=true;epoch++;if(id!==null)cancel(id);id=null;last=null;}};
+  }
+  return {budget,createField,stepField,nearLinks,makeMeteor,advanceMeteors,createLoop};
+});
+```
+
+### `static/effects.js`
+
+```javascript
+'use strict';
+// 独立装饰层：不读取表单值、不保存材料、不请求外部资源。
+(() => {
+  const C=window.CareerFXCore;
+  if(!C||window.CareerEffects)return;
+  const reduced=matchMedia('(prefers-reduced-motion: reduce)'),fine=matchMedia('(hover: hover) and (pointer: fine)');
+  const body=document.body,root=document.documentElement;
+  const layer=document.createElement('div');layer.className='fx-cosmos';layer.setAttribute('aria-hidden','true');
+  ['blue','violet','cyan'].forEach(color=>{const n=document.createElement('i');n.className='fx-aurora '+color;layer.append(n);});
+  const canvas=document.createElement('canvas');canvas.className='fx-canvas';layer.append(canvas);body.prepend(layer);
+  const ctx=canvas.getContext('2d',{alpha:true});
+  let mode='full',width=1,height=1,config,points=[],meteors=[],bursts=[],loop,nextShower=0,resizeFrame=0,alive=true;
+  const pointer={x:-1000,y:-1000};
+  const cards=new Set(),cardSelectors='.overview-hero,.overview-continue,.overview-feature,.cinema-feature,.cinema-growth,.panel,.metric,.week-card,.entry-card,.auth-story,.demo-panel,.star-panel,.star-map-shell,.star-hud,.star-config';
+  const atlas='/static/assets/glass-icons.png',names=['shield','grid','file','alert','lock','tree','route','list','arrow','upload','check','trash','spark','download','user','mic'];
+  const centerX=[190,480,772,1065],centerY=[180,473,767,1057];
+  const svgNS='http://www.w3.org/2000/svg';
+  // 用亮度生成alpha，使黑底图集成为透明玻璃图标，避免方形底块。
+  const defsRoot=document.createElementNS(svgNS,'svg');defsRoot.classList.add('fx-icon-defs');defsRoot.setAttribute('aria-hidden','true');
+  const defs=document.createElementNS(svgNS,'defs'),filter=document.createElementNS(svgNS,'filter'),matrix=document.createElementNS(svgNS,'feColorMatrix');
+  filter.id='fx-icon-alpha';filter.setAttribute('filterUnits','userSpaceOnUse');filter.setAttribute('x','0');filter.setAttribute('y','0');filter.setAttribute('width','280');filter.setAttribute('height','280');filter.setAttribute('color-interpolation-filters','sRGB');matrix.setAttribute('type','matrix');matrix.setAttribute('values','1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  1 1 1 0 -0.03');filter.append(matrix);defs.append(filter);defsRoot.append(defs);body.prepend(defsRoot);
+  function paintIcon(svg,name){
+    if(svg.dataset.fxIcon||!names.includes(name))return;
+    const index=names.indexOf(name),img=document.createElementNS(svgNS,'image');
+    img.setAttribute('href',atlas);img.setAttribute('x',String(140-centerX[index%4]));img.setAttribute('y',String(140-centerY[Math.floor(index/4)]));img.setAttribute('width','1254');img.setAttribute('height','1254');
+    img.setAttribute('filter','url(#fx-icon-alpha)');svg.replaceChildren(img);svg.setAttribute('viewBox','0 0 280 280');svg.setAttribute('aria-hidden','true');svg.dataset.fxIcon=name;svg.classList.add('fx-glass-icon');
+  }
+  function newIcon(name){const svg=document.createElementNS(svgNS,'svg');paintIcon(svg,name);return svg;}
+  function upgradeIcons(scope){
+    const svgs=[...(scope.matches?.('svg')?[scope]:[]),...scope.querySelectorAll('svg')];
+    svgs.forEach(svg=>{
+      if(svg.closest('.sprite,.fx-icon-defs,#tree-scene')||svg.dataset.fxIcon)return;
+      const href=svg.querySelector('use')?.getAttribute('href');
+      let name=href?.replace('#i-','');
+      if(!name&&svg.closest('.site-mark,.brand-mark'))name='shield';
+      if(names.includes(name))paintIcon(svg,name);
+    });
+    scope.querySelectorAll('.site-brand>img[src="/static/mark.svg"]').forEach(img=>img.replaceWith(newIcon('shield')));
+    const glyphSelector='.star-orb,.star-detail-symbol,.star-career-item>span:first-child,.model-logo,.camera-tool-icon,.camera-placeholder>span,.voice-orb,.avatar,.top-avatar,.icon-button:not([data-action=close-dialog])';
+    [...(scope.matches?.(glyphSelector)?[scope]:[]),...scope.querySelectorAll(glyphSelector)].forEach(el=>{
+      if(el.dataset.fxIcon)return;
+      let name='spark';
+      const glyphName={'⌘':'grid','⬡':'tree','▥':'list','✦':'spark','◇':'shield','☁':'upload','✓':'check','▯':'file','⌁':'route'}[el.textContent.trim()];
+      const node=el.closest('.star-node');
+      if(node)name=node.classList.contains('student')?'shield':node.classList.contains('group')?'tree':node.classList.contains('completed')?'check':node.classList.contains('career')?(glyphName||'route'):'file';
+      else if(el.classList.contains('model-logo'))name=el.classList.contains('llm-logo')?'spark':'file';
+      else if(el.matches('.camera-tool-icon,.camera-placeholder>span,.avatar,.top-avatar'))name='user';
+      else if(el.classList.contains('voice-orb'))name='mic';
+      else if(glyphName)name=glyphName;
+      el.replaceChildren(newIcon(name));el.dataset.fxIcon=name;
+    });
+  }
+  const visibleObserver='IntersectionObserver'in window?new IntersectionObserver(entries=>entries.forEach(e=>e.target.classList.toggle('fx-visible',e.isIntersecting)),{rootMargin:'80px'}):null;
+  function decorate(scope){
+    upgradeIcons(scope);
+    const matches=[...(scope.matches?.(cardSelectors)?[scope]:[]),...scope.querySelectorAll(cardSelectors)];
+    matches.forEach(card=>{
+      if(card.dataset.fxCard)return;
+      card.dataset.fxCard='true';card.classList.add('fx-card');cards.add(card);
+      const edge=document.createElement('span');edge.className='fx-edge';edge.setAttribute('aria-hidden','true');card.append(edge);
+      const spot=document.createElement('span');spot.className='fx-spot';spot.setAttribute('aria-hidden','true');
+      const light=document.createElement('span');light.className='fx-spot-light';spot.append(light);card.append(spot);
+      if(visibleObserver)visibleObserver.observe(card);else card.classList.add('fx-visible');
+      let frame=0,lastPoint;
+      const canTilt=card.matches('.overview-feature,.cinema-feature,.metric,.entry-card');
+      card.addEventListener('pointermove',event=>{
+        if(mode==='off'||reduced.matches||!fine.matches||event.pointerType!=='mouse'||document.hidden)return;
+        lastPoint={x:event.clientX,y:event.clientY};if(frame)return;
+        frame=requestAnimationFrame(()=>{
+          frame=0;if(!lastPoint||reduced.matches||document.hidden||mode==='off')return;
+          const rect=card.getBoundingClientRect(),x=lastPoint.x-rect.left,y=lastPoint.y-rect.top;
+          light.style.transform=`translate3d(${x-140}px,${y-140}px,0)`;
+          if(canTilt&&mode==='full'&&!body.classList.contains('motion-keyboard')){
+            const rx=Math.max(-3,Math.min(3,(.5-y/rect.height)*6)),ry=Math.max(-3,Math.min(3,(x/rect.width-.5)*6));
+            card.style.transform=`perspective(900px) rotateX(${rx}deg) rotateY(${ry}deg) translateY(-2px)`;
+          }
+        });
+      });
+      const reset=()=>{cancelAnimationFrame(frame);frame=0;lastPoint=null;card.style.transform='';light.style.transform='';};
+      card.addEventListener('pointerleave',reset);card.addEventListener('focusout',reset);card.fxReset=reset;
+    });
+  }
+  function syncPause(){
+    body.classList.toggle('fx-paused',!alive||document.hidden||reduced.matches||mode==='off');
+    loop?.setActive(alive&&!document.hidden&&config.fps>0);
+    if(document.hidden||reduced.matches||mode==='off')cards.forEach(card=>card.fxReset?.());
+  }
+  function render(dt,stamp){
+    if(!ctx)return;
+    ctx.clearRect(0,0,width,height);
+    if(mode==='off')return;
+    const time=stamp/1000;
+    C.stepField(points,dt,width,height);
+    ctx.lineWidth=.65;
+    const distance=mode==='lite'?95:150;
+    C.nearLinks(points,distance,config.links).forEach(([a,b,d])=>{
+      const p=points[a],q=points[b];ctx.beginPath();ctx.strokeStyle=`rgba(107,160,246,${(1-d)*.24})`;ctx.moveTo(p.x,p.y);ctx.lineTo(q.x,q.y);ctx.stroke();
+    });
+    points.forEach(p=>{
+      const alpha=.32+(Math.sin(time*1.2+p.phase)+1)*.25;
+      ctx.beginPath();ctx.fillStyle=`hsla(${p.hue},90%,82%,${alpha})`;ctx.arc(p.x,p.y,p.r,0,Math.PI*2);ctx.fill();
+      const dx=pointer.x-p.x,dy=pointer.y-p.y,d=Math.hypot(dx,dy);
+      if(mode==='full'&&d<145){ctx.beginPath();ctx.strokeStyle=`rgba(144,212,255,${(1-d/145)*.4})`;ctx.moveTo(p.x,p.y);ctx.lineTo(pointer.x,pointer.y);ctx.stroke();}
+    });
+    if(config.meteors&&stamp>=nextShower){
+      const count=Math.min(mode==='full'?3:1,config.meteors-meteors.length);
+      for(let i=0;i<count;i++)meteors.push(C.makeMeteor(width,height));
+      nextShower=stamp+(mode==='full'?850:2300);
+    }
+    meteors=C.advanceMeteors(meteors,dt,width,height);
+    meteors.forEach(m=>{
+      const fade=Math.max(0,Math.min(1,m.age*4,(m.life-m.age)*3));
+      const tailX=m.x+m.length*.85,tailY=m.y-m.length*.53,g=ctx.createLinearGradient(m.x,m.y,tailX,tailY);
+      g.addColorStop(0,`rgba(230,246,255,${fade})`);g.addColorStop(.15,`hsla(${m.hue},95%,75%,${fade*.8})`);g.addColorStop(1,`hsla(${m.hue},95%,70%,0)`);
+      ctx.beginPath();ctx.strokeStyle=g;ctx.lineWidth=1.8;ctx.moveTo(m.x,m.y);ctx.lineTo(tailX,tailY);ctx.stroke();
+      ctx.beginPath();ctx.fillStyle=`rgba(232,248,255,${fade})`;ctx.arc(m.x,m.y,1.7,0,Math.PI*2);ctx.fill();
+    });
+    bursts=bursts.filter(b=>{
+      b.age+=dt;if(b.age>.65)return false;
+      const t=b.age;ctx.beginPath();ctx.fillStyle=`rgba(162,216,255,${1-t/.65})`;ctx.arc(b.x+b.vx*t,b.y+b.vy*t+50*t*t,1.3,0,Math.PI*2);ctx.fill();return true;
+    });
+  }
+  function configure(){
+    cards.forEach(card=>card.fxReset?.());
+    document.querySelectorAll('[data-tilt]').forEach(el=>{el.style.transform='';});
+    loop?.dispose();width=Math.max(1,innerWidth);height=Math.max(1,innerHeight);config=C.budget(width,mode,reduced.matches);
+    const scale=Math.min(devicePixelRatio||1,config.dpr,Math.sqrt(2000000/(width*height)));
+    canvas.width=Math.round(width*scale);canvas.height=Math.round(height*scale);ctx?.setTransform(scale,0,0,scale,0,0);
+    points=C.createField(width,height,config.particles);meteors=[];bursts=[];nextShower=0;
+    if(config.meteors){const seed=C.makeMeteor(width,height);seed.x=width*.76;seed.y=height*.15;seed.age=.25;meteors.push(seed);}
+    body.dataset.fxMode=mode;layer.hidden=mode==='off';
+    if(ctx){render(0,performance.now());loop=C.createLoop({request:requestAnimationFrame,cancel:cancelAnimationFrame,draw:render,interval:config.fps?1000/config.fps:1000});}
+    syncPause();
+  }
+  const label=document.createElement('label');label.className='fx-toolbar';label.append(document.createTextNode('特效 '));
+  const select=document.createElement('select');select.id='visual-effects-mode';select.setAttribute('aria-label','视觉特效强度');
+  [['full','全开'],['lite','轻量'],['off','关闭']].forEach(([value,title])=>{const o=document.createElement('option');o.value=value;o.textContent=title;select.append(o);});
+  label.append(select);(document.querySelector('.top-actions,.site-nav,.admin-top')||body).append(label);
+  select.addEventListener('change',()=>{mode=select.value;configure();});
+  const onMove=e=>{if(e.pointerType==='mouse'){pointer.x=e.clientX;pointer.y=e.clientY;}};
+  const onClick=e=>{
+    if(mode==='off'||reduced.matches||document.hidden||e.target.closest('input,textarea,select,.fx-toolbar'))return;
+    const button=e.target.closest('.button,.pill,.nav-item,.overview-feature');
+    if(button&&!button.disabled){
+      button.classList.add('fx-press');const r=button.getBoundingClientRect(),ripple=document.createElement('span');ripple.className='fx-ripple';ripple.setAttribute('aria-hidden','true');ripple.style.left=`${e.clientX-r.left}px`;ripple.style.top=`${e.clientY-r.top}px`;button.append(ripple);
+      ripple.addEventListener('animationend',()=>ripple.remove(),{once:true});setTimeout(()=>ripple.remove(),900);
+    }
+    if(mode==='full'&&bursts.length<60)for(let i=0;i<10;i++){const a=Math.random()*Math.PI*2,s=25+Math.random()*70;bursts.push({x:e.clientX,y:e.clientY,vx:Math.cos(a)*s,vy:Math.sin(a)*s,age:0});}
+  };
+  const onResize=()=>{cancelAnimationFrame(resizeFrame);resizeFrame=requestAnimationFrame(configure);};
+  document.addEventListener('pointermove',onMove,{passive:true});document.addEventListener('pointerdown',onClick,{passive:true});
+  document.addEventListener('pointerleave',()=>{pointer.x=pointer.y=-1000;});
+  document.addEventListener('keydown',()=>cards.forEach(card=>card.fxReset?.()),{passive:true});
+  window.addEventListener('viewchange',()=>{pointer.x=pointer.y=-1000;bursts=[];cards.forEach(card=>card.fxReset?.());});
+  document.addEventListener('visibilitychange',syncPause);window.addEventListener('resize',onResize,{passive:true});reduced.addEventListener('change',configure);
+  const mutation=new MutationObserver(records=>{
+    for(const record of records)for(const item of record.addedNodes)if(item.nodeType===1&&!item.closest?.('.fx-cosmos'))decorate(item);
+    for(const card of cards)if(!card.isConnected){visibleObserver?.unobserve(card);card.fxReset?.();cards.delete(card);}
+  });
+  decorate(document);mutation.observe(body,{childList:true,subtree:true});configure();
+  // pagehide暂停但不销毁，保证浏览器后退缓存恢复后仍可继续。
+  window.addEventListener('pagehide',()=>{alive=false;loop?.setActive(false);body.classList.add('fx-paused');cards.forEach(card=>card.fxReset?.());});
+  window.addEventListener('pageshow',()=>{alive=true;syncPause();});
+  window.CareerEffects={setMode(next){if(['full','lite','off'].includes(next)){mode=next;select.value=next;configure();}},get mode(){return mode;}};
+})();
+```
+
 ### `static/cinematic.css`
 
 ```css
@@ -2836,12 +3618,12 @@ html.motion-ready [data-entrance]{transition:opacity 600ms var(--ease),transform
     if (!host) return;
     let frame = 0, latest;
     host.addEventListener('pointermove', event => {
-      if (reduced.matches || !finePointer.matches || document.hidden || event.pointerType !== 'mouse') return;
+      if (reduced.matches || !finePointer.matches || document.hidden || window.CareerEffects?.mode==='off' || event.pointerType !== 'mouse') return;
       latest = {x: event.clientX, y: event.clientY};
       if (frame) return;
       frame = requestAnimationFrame(() => {
         frame = 0;
-        if (!latest || reduced.matches || document.hidden) return;
+        if (!latest || reduced.matches || document.hidden || window.CareerEffects?.mode==='off') return;
         const rect = host.getBoundingClientRect();
         const x = Math.max(-1, Math.min(1, (latest.x - rect.left) / rect.width * 2 - 1));
         const y = Math.max(-1, Math.min(1, (latest.y - rect.top) / rect.height * 2 - 1));
@@ -2988,7 +3770,9 @@ dialog::backdrop{background:#020714b3}
 
 ```html
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#05070b"><meta name="color-scheme" content="dark"><title>让未来，有据可循 · 职安</title><link rel="icon" href="/static/mark.svg"><link rel="stylesheet" href="/static/portal.css"><link rel="stylesheet" href="/static/theme.css"><link rel="stylesheet" href="/static/cinematic.css"><script src="/static/portal.js" defer></script><script src="/static/cinematic.js" defer></script></head>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#05070b"><meta name="color-scheme" content="dark"><title>让未来，有据可循 · 职安</title><link rel="icon" href="/static/mark.svg"><link rel="stylesheet" href="/static/portal.css"><link rel="stylesheet" href="/static/theme.css"><link rel="stylesheet" href="/static/cinematic.css"><script src="/static/portal.js" defer></script><script src="/static/cinematic.js" defer></script><link rel="stylesheet" href="/static/effects.css"><script src="/static/effects-core.js" defer></script><script src="/static/effects.js" defer></script>
+<link rel="stylesheet" href="/static/guide-assistant.css"><script type="module" src="/static/robot-welcome.js"></script>
+</head>
 <body data-page="home" class="cinematic-home">
 <a class="cinema-skip" href="#home-main">跳到主要内容</a>
 <header class="site-header"><a class="site-brand" href="/" aria-label="职安首页"><img src="/static/mark.svg" alt="" width="34" height="38"><span>职安<small>CAREER GUARD</small></span></a><nav class="site-nav" aria-label="页面导航"><a href="#safety" class="optional">求职安全</a><a href="#growth" class="optional">职业成长</a><a href="/app#interview" class="optional">AI 面试</a><a href="/login" id="home-account" class="pill dark">登录 / 注册 <span aria-hidden="true">↗</span></a></nav></header>
@@ -3063,12 +3847,12 @@ function show(view, keyboard=false) {
   window.dispatchEvent(new CustomEvent('viewchange',{detail:view}));
 }
 function refreshExpiry() {clearTimeout(state.timer);}
-async function api(path, {method='GET',data,body,headers={},download=false,signal}={}) {
+async function api(path, {method='GET',data,body,headers={},download=false,signal,keepalive=false}={}) {
   const epoch=state.epoch;
   const h={...headers};
   if(method!=='GET')h['X-CSRF-Token']=state.csrf;
   if(data!==undefined){h['Content-Type']='application/json';body=JSON.stringify(data);}
-  const response=await fetch('/api'+path,{method,headers:h,body,signal,credentials:'same-origin',cache:'no-store',redirect:'error'});
+  const response=await fetch('/api'+path,{method,headers:h,body,signal,keepalive,credentials:'same-origin',cache:'no-store',redirect:'error'});
   if(epoch!==state.epoch)throw new DOMException('旧任务结果已丢弃','AbortError');
   if(!response.ok){
     let detail='处理未完成，请稍后重试。';
@@ -4079,6 +4863,8 @@ input:not([type=checkbox]):not([type=radio]){width:100%;box-sizing:border-box;bo
   <link rel="stylesheet" href="/static/styles.css"><link rel="stylesheet" href="/static/platform.css"><link rel="stylesheet" href="/static/camera.css"><script src="/static/app.js" defer></script><link rel="stylesheet" href="/static/starmap.css"><script src="/static/star-graph.js" defer></script><script src="/static/star-display.js" defer></script><script src="/static/starmap.js" defer></script><script src="/static/tree-canvas.js" defer></script><script src="/static/platform.js" defer></script><script src="/static/camera.js" defer></script>
 <link rel="stylesheet" href="/static/theme.css">
 <link rel="stylesheet" href="/static/cinematic.css"><script src="/static/cinematic.js" defer></script>
+<link rel="stylesheet" href="/static/effects.css"><script src="/static/effects-core.js" defer></script><script src="/static/effects.js" defer></script>
+<link rel="stylesheet" href="/static/guide-assistant.css"><script src="/static/guide-core.js" defer></script><script type="module" src="/static/guide-assistant.js"></script>
 </head>
 <body class="star-theme">
 <svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
@@ -4156,6 +4942,7 @@ input:not([type=checkbox]):not([type=radio]){width:100%;box-sizing:border-box;bo
 ```html
 <!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#05070b"><title>登录 · 职安</title><link rel="icon" href="/static/mark.svg"><link rel="stylesheet" href="/static/portal.css"><script src="/static/portal.js" defer></script><link rel="stylesheet" href="/static/theme.css">
 <link rel="stylesheet" href="/static/cinematic.css"><script src="/static/cinematic.js" defer></script>
+<link rel="stylesheet" href="/static/effects.css"><script src="/static/effects-core.js" defer></script><script src="/static/effects.js" defer></script>
 </head><body data-page="login"><header class="site-header"><a class="site-brand" href="/" aria-label="职安首页"><span class="site-mark"><svg viewBox="0 0 24 28" aria-hidden="true"><path d="M12 2 3 6v7c0 6 9 12 9 12s9-6 9-12V6Z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m7 13 3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></span><span>职安<small>CAREER GUARD</small></span></a><nav class="site-nav" aria-label="页面导航"><a href="/demo" class="optional">访客体验</a><a href="/login?next=admin" class="optional">管理入口</a><a href="/login" id="home-account" class="pill dark">登录 / 注册 ↗</a></nav></header><main class="auth-main"><aside class="auth-story"><div><div class="eyebrow">A SAFER WAY FORWARD</div><h1>每一次认真准备，<br>都值得被看见。</h1><p>看清机会、保护隐私、找到方向。<br>让求职的下一步，更有底气。</p></div><div class="auth-steps"><div><span>01</span> 看懂岗位与风险</div><div><span>02</span> 制定有依据的成长路线</div><div><span>03</span> 记录实践与学习成果</div></div></aside><section class="auth-card"><div class="eyebrow">YOUR NEXT CHAPTER</div><h2>欢迎回来，继续向前</h2><p class="subtitle">登录后进入个人工作台，管理员将进入独立后台。</p><form id="account-form"><div class="portal-field"><label for="username">账号</label><input id="username" name="username" minlength="4" maxlength="32" pattern="[A-Za-z0-9_\-]{4,32}" autocomplete="username" placeholder="4–32 位字母、数字、下划线或横线" required></div><div class="portal-field"><label for="password">密码</label><div class="password-field"><input id="password" name="password" type="password" minlength="1" maxlength="128" autocomplete="current-password" placeholder="输入你的密码" required><button class="password-toggle" type="button" data-toggle-password>显示</button></div></div><button class="pill dark" type="submit">登录 <span>→</span></button></form><div id="portal-message" class="portal-message" role="status" aria-live="polite"></div><p class="auth-switch">还没有账号？<a href="/register">免费注册</a></p><div class="auth-minor"><a href="/">← 返回首页</a><a href="/demo">先体验访客演示 →</a></div></section></main><footer class="site-footer"><span>职安 · 让每一个认真求职的人，更从容地向前。</span><span><a href="/">首页</a>　 /　 <a href="/app">求职工作台</a>　 /　 <a href="/login?next=admin">管理后台</a></span></footer></body></html>
 ```
 
@@ -4164,6 +4951,7 @@ input:not([type=checkbox]):not([type=radio]){width:100%;box-sizing:border-box;bo
 ```html
 <!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#05070b"><title>注册 · 职安</title><link rel="icon" href="/static/mark.svg"><link rel="stylesheet" href="/static/portal.css"><script src="/static/portal.js" defer></script><link rel="stylesheet" href="/static/theme.css">
 <link rel="stylesheet" href="/static/cinematic.css"><script src="/static/cinematic.js" defer></script>
+<link rel="stylesheet" href="/static/effects.css"><script src="/static/effects-core.js" defer></script><script src="/static/effects.js" defer></script>
 </head><body data-page="register"><header class="site-header"><a class="site-brand" href="/" aria-label="职安首页"><span class="site-mark"><svg viewBox="0 0 24 28" aria-hidden="true"><path d="M12 2 3 6v7c0 6 9 12 9 12s9-6 9-12V6Z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m7 13 3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></span><span>职安<small>CAREER GUARD</small></span></a><nav class="site-nav" aria-label="页面导航"><a href="/demo" class="optional">访客体验</a><a href="/login?next=admin" class="optional">管理入口</a><a href="/login" id="home-account" class="pill dark">登录 / 注册 ↗</a></nav></header><main class="auth-main"><aside class="auth-story"><div><div class="eyebrow">A SAFER WAY FORWARD</div><h1>每一次认真准备，<br>都值得被看见。</h1><p>看清机会、保护隐私、找到方向。<br>让求职的下一步，更有底气。</p></div><div class="auth-steps"><div><span>01</span> 看懂岗位与风险</div><div><span>02</span> 制定有依据的成长路线</div><div><span>03</span> 记录实践与学习成果</div></div></aside><section class="auth-card"><div class="eyebrow">CREATE YOUR ACCOUNT</div><h2>创建你的职安账号</h2><p class="subtitle">一个账号，保存你的求职准备与成长记录。</p><form id="account-form"><div class="portal-field"><label for="username">账号</label><input id="username" name="username" minlength="4" maxlength="32" pattern="[A-Za-z0-9_\-]{4,32}" autocomplete="username" placeholder="4–32 位字母、数字、下划线或横线" required></div><div class="portal-field"><label for="password">密码</label><div class="password-field"><input id="password" name="password" type="password" minlength="10" maxlength="128" autocomplete="new-password" placeholder="至少 10 位，使用多种字符" required><button class="password-toggle" type="button" data-toggle-password>显示</button></div></div><div class="portal-field"><label for="confirm-password">确认密码</label><input id="confirm-password" type="password" minlength="10" maxlength="128" autocomplete="new-password" placeholder="再次输入密码" required></div><button class="pill dark" type="submit">创建账号，开始准备 <span>→</span></button></form><div id="portal-message" class="portal-message" role="status" aria-live="polite"></div><p class="auth-switch">已有账号？<a href="/login">去登录</a></p><div class="auth-minor"><a href="/">← 返回首页</a><a href="/demo">先体验访客演示 →</a></div></section></main><footer class="site-footer"><span>职安 · 让每一个认真求职的人，更从容地向前。</span><span><a href="/">首页</a>　 /　 <a href="/app">求职工作台</a>　 /　 <a href="/login?next=admin">管理后台</a></span></footer></body></html>
 ```
 
@@ -4172,6 +4960,7 @@ input:not([type=checkbox]):not([type=radio]){width:100%;box-sizing:border-box;bo
 ```html
 <!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#05070b"><title>访客演示 · 职安</title><link rel="icon" href="/static/mark.svg"><link rel="stylesheet" href="/static/portal.css"><script src="/static/portal.js" defer></script><link rel="stylesheet" href="/static/theme.css">
 <link rel="stylesheet" href="/static/cinematic.css"><script src="/static/cinematic.js" defer></script>
+<link rel="stylesheet" href="/static/effects.css"><script src="/static/effects-core.js" defer></script><script src="/static/effects.js" defer></script>
 </head><body data-page="demo"><header class="site-header"><a class="site-brand" href="/" aria-label="职安首页"><span class="site-mark"><svg viewBox="0 0 24 28" aria-hidden="true"><path d="M12 2 3 6v7c0 6 9 12 9 12s9-6 9-12V6Z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m7 13 3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></span><span>职安<small>CAREER GUARD</small></span></a><nav class="site-nav" aria-label="页面导航"><a href="/demo" class="optional">访客体验</a><a href="/login?next=admin" class="optional">管理入口</a><a href="/login" id="home-account" class="pill dark">登录 / 注册 ↗</a></nav></header><main class="demo-main"><div class="demo-heading"><div class="eyebrow">A SMALL PREVIEW / NO ACCOUNT NEEDED</div><h1>先体验，再决定<br>从哪里开始。</h1><p>这里使用固定合成材料，演示风险识别、隐私脱敏与职业规划。无需填写个人资料。</p></div><aside class="demo-ephemeral"><strong>数据，只在此刻</strong><p>访客演示只在当前页面显示，闲置 30 分钟后清空。</p><button class="pill" type="button" data-clear-demo>清空本次数据</button></aside><div class="demo-tabs" aria-label="演示功能"><button class="pill" data-demo="risk" aria-pressed="true">01 招聘风险</button><button class="pill" data-demo="privacy" aria-pressed="false">02 隐私脱敏</button><button class="pill" data-demo="plan" aria-pressed="false">03 成长规划</button></div><section class="demo-panel"><div class="demo-result"><pre id="demo-material">正在载入固定演示材料…</pre><div id="demo-output" aria-live="polite"></div></div></section><div class="demo-cta"><div><h3>准备好，开始你的求职计划了吗？</h3><p>登录后上传自己的材料，生成 AI 技能树并保存学习记录。</p></div><a class="pill dark" href="/register">创建账号 →</a></div><p class="demo-caption">访客仅有固定样例演示，无文件上传、AI调用、点评发布或数据保存权限。</p></main><footer class="site-footer"><span>职安 · 让每一个认真求职的人，更从容地向前。</span><span><a href="/">首页</a>　 /　 <a href="/app">求职工作台</a>　 /　 <a href="/login?next=admin">管理后台</a></span></footer></body></html>
 ```
 
@@ -4246,6 +5035,7 @@ if(document.body.dataset.page==='demo'){
 ```html
 <!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>职安 · 管理控制台</title><link rel="icon" href="/static/mark.svg"><link rel="stylesheet" href="/static/styles.css"><link rel="stylesheet" href="/static/platform.css"><link rel="stylesheet" href="/static/admin.css"><script src="/static/portal.js" defer></script><script src="/static/admin-actions.js" defer></script><script src="/static/admin.js" defer></script><link rel="stylesheet" href="/static/theme.css">
 <link rel="stylesheet" href="/static/cinematic.css"><script src="/static/cinematic.js" defer></script>
+<link rel="stylesheet" href="/static/effects.css"><script src="/static/effects-core.js" defer></script><script src="/static/effects.js" defer></script>
 </head><body><aside class="admin-sidebar"><a class="admin-brand" href="/">职安 <small>ADMIN CONSOLE</small></a><span class="admin-caption">平台管理控制台</span><nav aria-label="管理导航"><a href="#view-admin">平台总览</a><a href="#admin-users">用户管理</a><a href="#admin-publish">推荐岗位</a><a href="#admin-reviews">点评管理</a><a href="#admin-security">内置安全与审计</a></nav><div class="admin-sidebar-foot"><a href="/app">前往求职工作台 ↗</a><a href="/">返回首页 ↗</a><button id="admin-logout">退出登录</button></div></aside><div class="admin-shell"><header class="admin-top"><span>管理后台 / 独立控制台</span><span id="admin-identity">正在验证管理员…</span></header><main id="admin-main"><p id="admin-loading">正在载入平台数据…</p></main></div><div id="toast" class="toast" role="status" hidden></div></body></html>
 ```
 
@@ -4491,6 +5281,141 @@ window.CameraAssist=(()=>{
 ```
 
 ## ④ 测试用例与匿名样例
+
+### `tests/test_onboarding.py`
+
+```python
+from fastapi.testclient import TestClient
+from app.main import app
+
+
+def register(client,username):
+    client.headers['X-CSRF-Token']=client.get('/api/auth/session').json()['csrf_token']
+    result=client.post('/api/auth/register',json={'username':username,'password':'Guide-testing-2026!'})
+    assert result.status_code==200
+    client.headers['X-CSRF-Token']=result.json()['csrf_token']
+
+
+def test_new_user_guide_is_private_and_survives_login():
+    with TestClient(app) as a, TestClient(app) as b:
+        register(a,'guide_alpha');register(b,'guide_beta')
+        initial=a.get('/api/onboarding');assert initial.status_code==200
+        assert initial.json()['auto_start'] is True and initial.json()['step']==0
+        assert initial.json()['steps']==10
+        assert a.post('/api/onboarding',json={'action':'progress','step':4}).status_code==200
+        assert b.get('/api/onboarding').json()['step']==0
+        assert a.post('/api/onboarding',json={'action':'skip','step':4}).json()['status']=='skipped'
+        a.post('/api/auth/logout')
+        a.headers['X-CSRF-Token']=a.get('/api/auth/session').json()['csrf_token']
+        login=a.post('/api/auth/login',json={'username':'guide_alpha','password':'Guide-testing-2026!'})
+        a.headers['X-CSRF-Token']=login.json()['csrf_token']
+        saved=a.get('/api/onboarding').json()
+        assert saved['status']=='skipped' and saved['auto_start'] is False
+
+
+def test_guide_requires_session_csrf_and_valid_step():
+    with TestClient(app) as c:
+        assert c.get('/api/onboarding').status_code==401
+        register(c,'guide_valid')
+        assert c.post('/api/onboarding',json={'action':'progress','step':10}).status_code==422
+        assert c.post('/api/onboarding',json={'action':'complete','step':2}).status_code==422
+        c.headers['X-CSRF-Token']='invalid'
+        assert c.post('/api/onboarding',json={'action':'skip','step':0}).status_code==403
+
+
+def test_complete_is_not_repeated_and_existing_admin_can_replay():
+    with TestClient(app) as c:
+        c.headers['X-CSRF-Token']=c.get('/api/auth/session').json()['csrf_token']
+        result=c.post('/api/auth/login',json={'username':'admin','password':'admin'})
+        c.headers['X-CSRF-Token']=result.json()['csrf_token']
+        assert c.get('/api/onboarding').json()['auto_start'] is False
+        assert c.post('/api/onboarding',json={'action':'start','step':0}).json()['auto_start'] is True
+        assert c.post('/api/onboarding',json={'action':'progress','step':9}).status_code==200
+        assert c.post('/api/onboarding',json={'action':'complete','step':9}).json()['auto_start'] is False
+        assert c.get('/api/onboarding').json()['status']=='completed'
+        assert c.post('/api/onboarding',json={'action':'start','step':0}).json()['step']==0
+```
+
+### `tests/test_guide.mjs`
+
+```text
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+const require=createRequire(import.meta.url),Guide=require('../static/guide-core.js');
+test('十步覆盖真实前台入口且目标选择器固定，不拼接用户内容',()=>{
+  assert.equal(Guide.STEPS.length,10);
+  assert.deepEqual(Guide.STEPS.map(s=>s.view),['overview','materials','risk','privacy','career','tree','exam','interview','jobs','profile']);
+  assert.ok(Guide.STEPS.every(s=>typeof s.target==='string'&&s.title&&s.body));
+});
+test('桌面与手机、靠近各边角的目标都保证机器人和气泡在视口内',()=>{
+  for(const [width,height] of [[1440,1024],[390,844],[320,568],[844,390]]){
+    for(const target of [{left:0,top:0,right:70,bottom:45},{left:width-70,top:height-40,right:width,bottom:height},{left:20,top:height/2-80,right:width-20,bottom:height/2+80}]){
+      const layout=Guide.place(target,{width,height});
+      for(const r of [layout.robot,layout.bubble])assert.ok(r.x>=0&&r.y>=0&&r.x+r.width<=width+.1&&r.y+r.height<=height+.1,JSON.stringify({width,height,r}));
+      assert.ok(layout.aim.x>=0&&layout.aim.x<=width&&layout.aim.y>=0&&layout.aim.y<=height);
+    }
+  }
+});
+test('有空间时气泡与目标分开，机器人在气泡旁边',()=>{
+  const target={left:500,top:250,right:800,bottom:350},r=Guide.place(target,{width:1440,height:1024});
+  assert.ok(r.bubble.y>=target.bottom||r.bubble.y+r.bubble.height<=target.top||r.bubble.x>=target.right||r.bubble.x+r.bubble.width<=target.left);
+  assert.ok(r.robot.x>=r.bubble.x+r.bubble.width);
+});
+test('自动GET与手动POST乱序返回时只进入一次，关闭后不会保留重复模态锁',()=>{
+  const gate=Guide.createGate(),automatic=gate.version,manual=gate.begin();
+  assert.equal(gate.enter(automatic),false);assert.equal(gate.enter(manual),true);
+  assert.equal(gate.enter(manual),false);gate.close();assert.equal(gate.active,false);
+  assert.equal(gate.enter(automatic),false);
+});
+test('关闭会使迟到的步骤保存和启动结果失效，新一轮仍能正常进入',()=>{
+  const gate=Guide.createGate(),start=gate.begin();assert.equal(gate.enter(start),true);
+  const pending=gate.version;gate.close();assert.notEqual(gate.version,pending);
+  assert.equal(gate.enter(start),false);assert.equal(gate.enter(gate.begin()),true);
+});
+```
+
+### `tests/test_effects.mjs`
+
+```text
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+const require=createRequire(import.meta.url);
+const FX=require('../static/effects-core.js');
+test('移动端及轻量模式削减预算，关闭与减少动态没有连续帧',()=>{
+  const full=FX.budget(1440,'full',false),mobile=FX.budget(390,'full',false),lite=FX.budget(1440,'lite',false);
+  assert.ok(full.particles>mobile.particles&&full.particles>lite.particles);
+  assert.ok(full.meteors<=8&&full.links<=100&&full.particles<=100);
+  assert.equal(FX.budget(1440,'off',false).fps,0);
+  assert.equal(FX.budget(1440,'full',true).fps,0);
+});
+test('帧循环重复开启只调度一帧，暂停取消，迟到帧不能复活',()=>{
+  const pending=new Map();let seq=0,draws=0;
+  const loop=FX.createLoop({request:fn=>{pending.set(++seq,fn);return seq;},cancel:id=>pending.delete(id),draw:()=>draws++,interval:30});
+  loop.setActive(true);loop.setActive(true);assert.equal(pending.size,1);
+  const stale=[...pending.values()][0];loop.setActive(false);assert.equal(pending.size,0);
+  stale(100);assert.equal(draws,0);assert.equal(pending.size,0);
+  loop.setActive(true);assert.equal(pending.size,1);loop.dispose();assert.equal(pending.size,0);
+});
+test('帧循环按时间限帧，draw中暂停不会重新预约',()=>{
+  let fn,draws=0,loop;
+  loop=FX.createLoop({request:cb=>(fn=cb,1),cancel:()=>{},draw:()=>{if(++draws===2)loop.setActive(false);},interval:33});
+  loop.setActive(true);fn(0);fn(10);assert.equal(draws,1);fn(40);assert.equal(draws,2);
+  fn(80);assert.equal(draws,2);
+});
+test('粒子有界且超长暂停不会造成超大位移；连线不重复并遵守上限',()=>{
+  const p=FX.createField(100,100,30,()=>0.5),before=p[0].x;
+  p[0].vx=50;p[0].vy=-40;FX.stepField(p,100,100,100);assert.ok(Math.abs(p[0].x-before)<5);
+  assert.ok(p.every(s=>s.x>=0&&s.x<=100&&s.y>=0&&s.y<=100));
+  const links=FX.nearLinks(p,200,15);assert.equal(links.length,15);assert.deepEqual(FX.nearLinks(p,200,0),[]);
+  assert.equal(new Set(links.map(([a,b])=>a+':'+b)).size,links.length);assert.ok(links.every(([a,b])=>a<b));
+});
+test('过期流星被移除，不累计不可见对象',()=>{
+  const meteor=FX.makeMeteor(1000,800,()=>0.5);
+  const result=FX.advanceMeteors([meteor],meteor.life+1,1000,800);assert.equal(result.length,0);
+});
+```
 
 ### `tests/test_cinematic.mjs`
 
@@ -5916,3 +6841,8 @@ career-guard/
 ## 前端视觉版本 v0.11.0
 
 首页、工作台、星图与独立账户/后台统一为深色玻璃风格。公共视觉样式位于 `static/cinematic.css`，动效与入口增强位于 `static/cinematic.js`，独立生成素材位于 `static/assets/`。无需增加部署步骤；启动后刷新页面即可。设计说明与验证见 `docs/CINEMATIC_DESIGN.md`。
+
+
+## 强化特效与机器人引导 v0.12.0
+
+右上角可切换全开/轻量/关闭视觉效果。首页与工作台右侧为小安机器人；新注册账号自动进入引导，旧账号可点击机器人重放。引导进度按账号保存，无需新增部署服务。Three.js依赖已随源码本地打包。详见 `docs/VISUAL_EFFECTS.md` 与 `docs/ROBOT_GUIDE.md`。

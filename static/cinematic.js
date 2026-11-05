@@ -38,12 +38,12 @@
     if (!host) return;
     let frame = 0, latest;
     host.addEventListener('pointermove', event => {
-      if (reduced.matches || !finePointer.matches || document.hidden || event.pointerType !== 'mouse') return;
+      if (reduced.matches || !finePointer.matches || document.hidden || window.CareerEffects?.mode==='off' || event.pointerType !== 'mouse') return;
       latest = {x: event.clientX, y: event.clientY};
       if (frame) return;
       frame = requestAnimationFrame(() => {
         frame = 0;
-        if (!latest || reduced.matches || document.hidden) return;
+        if (!latest || reduced.matches || document.hidden || window.CareerEffects?.mode==='off') return;
         const rect = host.getBoundingClientRect();
         const x = Math.max(-1, Math.min(1, (latest.x - rect.left) / rect.width * 2 - 1));
         const y = Math.max(-1, Math.min(1, (latest.y - rect.top) / rect.height * 2 - 1));

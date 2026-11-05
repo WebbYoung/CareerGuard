@@ -40,12 +40,12 @@ function show(view, keyboard=false) {
   window.dispatchEvent(new CustomEvent('viewchange',{detail:view}));
 }
 function refreshExpiry() {clearTimeout(state.timer);}
-async function api(path, {method='GET',data,body,headers={},download=false,signal}={}) {
+async function api(path, {method='GET',data,body,headers={},download=false,signal,keepalive=false}={}) {
   const epoch=state.epoch;
   const h={...headers};
   if(method!=='GET')h['X-CSRF-Token']=state.csrf;
   if(data!==undefined){h['Content-Type']='application/json';body=JSON.stringify(data);}
-  const response=await fetch('/api'+path,{method,headers:h,body,signal,credentials:'same-origin',cache:'no-store',redirect:'error'});
+  const response=await fetch('/api'+path,{method,headers:h,body,signal,keepalive,credentials:'same-origin',cache:'no-store',redirect:'error'});
   if(epoch!==state.epoch)throw new DOMException('旧任务结果已丢弃','AbortError');
   if(!response.ok){
     let detail='处理未完成，请稍后重试。';

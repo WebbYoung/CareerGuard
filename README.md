@@ -223,3 +223,8 @@ career-guard/
 ## 前端视觉版本 v0.11.0
 
 首页、工作台、星图与独立账户/后台统一为深色玻璃风格。公共视觉样式位于 `static/cinematic.css`，动效与入口增强位于 `static/cinematic.js`，独立生成素材位于 `static/assets/`。无需增加部署步骤；启动后刷新页面即可。设计说明与验证见 `docs/CINEMATIC_DESIGN.md`。
+
+
+## 强化特效与机器人引导 v0.12.0
+
+右上角可切换全开/轻量/关闭视觉效果。首页与工作台右侧为小安机器人；新注册账号自动进入引导，旧账号可点击机器人重放。引导进度按账号保存，无需新增部署服务。Three.js依赖已随源码本地打包。详见 `docs/VISUAL_EFFECTS.md` 与 `docs/ROBOT_GUIDE.md`。

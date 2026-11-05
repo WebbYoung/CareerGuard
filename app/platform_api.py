@@ -14,6 +14,7 @@ from .api import Input, authorize, payload, compute
 from .database import connect, encode, password_hash, password_ok, cipher, event, ensure_superuser
 from .store import store
 from .services import growth, llm, starmap
+from .services.onboarding import GUIDE_ID
 
 router=APIRouter(prefix='/api')
 failures=defaultdict(deque)
@@ -99,6 +100,7 @@ async def register(request:Request,response:Response):
             uid=db.execute('INSERT INTO users(username,password,role) VALUES (?,?,?)',(data.username,hashed,role)).lastrowid
         except sqlite3.IntegrityError:
             raise HTTPException(409,'账号已存在。') from None
+        db.execute('INSERT INTO user_guides(user_id,guide_id) VALUES (?,?)',(uid,GUIDE_ID))
         event(db,uid,'register')
         user=public_user(db.execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone())
     csrf=rotate(request,response,uid)
