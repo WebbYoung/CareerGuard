@@ -772,6 +772,16 @@ def connect():
     if 'data_generation' not in {r[1] for r in db.execute('PRAGMA table_info(users)')}:
         db.execute('ALTER TABLE users ADD COLUMN data_generation INTEGER NOT NULL DEFAULT 0')
         db.commit()
+    if 'major' not in {r[1] for r in db.execute('PRAGMA table_info(trees)')}:
+        db.execute("ALTER TABLE trees ADD COLUMN major TEXT NOT NULL DEFAULT ''")
+        db.commit()
+    if 'assessment_progress' not in {r[1] for r in db.execute('PRAGMA table_info(trees)')}:
+        # 旧版自我记录保留在progress；考试解锁单独保存，不把自记误当考核结果。
+        db.execute("ALTER TABLE trees ADD COLUMN assessment_progress TEXT NOT NULL DEFAULT '[]'")
+        db.commit()
+    if 'unlock_node' not in {r[1] for r in db.execute('PRAGMA table_info(exams)')}:
+        db.execute('ALTER TABLE exams ADD COLUMN unlock_node TEXT')
+        db.commit()
     # 兼容已有数据库：旧用户岗位重新送审，管理员岗位继续公开。
     if 'status' not in {r[1] for r in db.execute('PRAGMA table_info(jobs)')}:
         db.execute("ALTER TABLE jobs ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
@@ -857,7 +867,7 @@ from . import config
 from .api import Input, authorize, payload, compute
 from .database import connect, encode, password_hash, password_ok, cipher, event, ensure_superuser
 from .store import store
-from .services import growth, llm
+from .services import growth, llm, starmap
 
 router=APIRouter(prefix='/api')
 failures=defaultdict(deque)
@@ -1145,6 +1155,7 @@ async def review(jid:int,request:Request):
 
 
 class TreeInput(Input):
+    major: str = Field(default='',max_length=80)
     occupation: str = Field(min_length=1,max_length=100)
     jd: str = Field(default='',max_length=8000)
     skills: list[str] = Field(default_factory=list,max_length=24)
@@ -1171,8 +1182,8 @@ def write_guard(db,user):
 
 
 def tree_view(row):
-    return {'id':row['id'],'occupation':row['occupation'],'jd':row['jd'],'tree':json.loads(row['content']),
-            'progress':json.loads(row['progress']),'source':'AI生成 · 学习参考'}
+    return {'id':row['id'],'occupation':row['occupation'],'jd':row['jd'],'tree':starmap.decorate(growth.Tree.model_validate_json(row['content']).model_dump(),json.loads(row['assessment_progress']),row['occupation'],row['major']),
+            'major':row['major'],'progress':json.loads(row['assessment_progress']),'source':'AI生成 · 学习参考'}
 
 
 @router.get('/learning/trees')
@@ -1188,23 +1199,24 @@ async def make_tree(request:Request):
     user=current(request)
     data=await payload(request,TreeInput);consent(data)
     occupation=growth.validate_input(data.occupation)
+    major=growth.validate_input(data.major)
     jd=growth.validate_input(data.jd)
     if any(len(x)>80 for x in data.skills): raise HTTPException(422,'技能名称过长。')
-    result=await compute(growth.generate_json,'根据目标岗位和JD生成8至14个技能节点，从基础到实践分层，prerequisites为前置节点id，依赖无环。每个task给出可交付实践。',
-                         {'occupation':occupation,'jd':jd,'gaps':data.skills},growth.Tree)
+    result=await compute(growth.generate_json,'面向任意专业与学习领域，按用户major、目标岗位、JD与能力缺口动态生成成长星图。不得默认用户为计算机专业；课程、实践和职业应与实际专业一致。learner_label使用对应专业学习者称呼。职业方向数量按输入需求决定，通常1至5个，禁止固定为九个。生成12至24个共享技能节点，公共基础技能→职业方向→专业技能→项目实战，依赖有向无环。多职业复用相同ID的基础与专业技能，允许多路径汇合，禁止复制互不关联的树。每个节点含stage、resources资源占位（不要URL）、task实战交付物；careers含id、name、description、core_skill_ids、projects，核心技能覆盖前置与项目。禁止输出录用概率或虚构完成状态。',
+                         {'major':major,'occupation':occupation,'jd':jd,'gaps':data.skills},growth.Tree)
     try: result=growth.Tree.model_validate(result).model_dump()
     except ValidationError: raise HTTPException(502,'模型技能树含无效依赖，原树保留，请重试。') from None
     current(request)
     with connect() as db:
         write_guard(db,user)
-        tid=db.execute('INSERT INTO trees(user_id,occupation,jd,content) VALUES (?,?,?,?)',(user['id'],occupation,jd,encode(result))).lastrowid
+        tid=db.execute('INSERT INTO trees(user_id,occupation,jd,content,major) VALUES (?,?,?,?,?)',(user['id'],occupation,jd,encode(result),major)).lastrowid
         event(db,user['id'],'tree_generate')
         row=db.execute('SELECT * FROM trees WHERE id=?',(tid,)).fetchone()
     return tree_view(row)
 
 
 class Progress(Input):
-    completed: list[str] = Field(max_length=24)
+    completed: list[str] = Field(max_length=64)
 
 
 @router.put('/learning/trees/{tid}/progress')
@@ -1215,20 +1227,22 @@ async def progress(tid:int,request:Request):
         done=set(data.completed);ids={n.id for n in tree.nodes}
         if not done<=ids or any(n.id in done and not set(n.prerequisites)<=done for n in tree.nodes):
             raise HTTPException(422,'完成记录包含未知节点或尚未完成的前置技能。')
-        db.execute('UPDATE trees SET progress=? WHERE id=?',(encode(sorted(done)),tid))
+        if not done<=set(json.loads(row['assessment_progress'])):raise HTTPException(422,'技能须通过节点考核后完成，不能直接添加完成记录。')
+        db.execute('UPDATE trees SET assessment_progress=? WHERE id=?',(encode(sorted(done)),tid))
         event(db,user['id'],'tree_progress')
     return {'completed':sorted(done)}
 
 
 class ExamInput(Input):
+    unlock: bool = False
     tree_id: int
     node_ids: list[str] = Field(min_length=1,max_length=8)
     consent: bool = False
 
 
-def exam_view(eid,questions):
+def exam_view(eid,questions,unlock=False):
     return {'id':eid,'questions':[{k:q[k] for k in ('question','options','skill')} for q in questions],
-            'source':'AI 技能练习'}
+            'source':'AI 节点考核 · 正确率80%通过' if unlock else 'AI 技能练习'}
 
 
 @router.post('/learning/exams')
@@ -1237,16 +1251,21 @@ async def create_exam(request:Request):
     with connect() as db: row=owned(db,'trees',data.tree_id,user['id'])
     selected=[n for n in json.loads(row['content'])['nodes'] if n['id'] in data.node_ids]
     if len(selected)!=len(set(data.node_ids)): raise HTTPException(422,'选择的技能不存在。')
+    if data.unlock:
+        if len(selected)!=1:raise HTTPException(422,'节点考核一次只选择一个技能。')
+        if not set(selected[0]['prerequisites'])<=set(json.loads(row['assessment_progress'])):raise HTTPException(422,'请先通过前置技能考核。')
+
     result=await compute(growth.generate_json,'围绕用户所选技能生成5道四选一单选题，只有一个正确答案，answer为0到3，给出准确解析，skill必须来自所选技能名称。',{'occupation':row['occupation'],'skills':selected},growth.Questions)
     try: questions=growth.Questions.model_validate(result).model_dump()['questions']
     except ValidationError: raise HTTPException(502,'模型题目格式未通过校验。') from None
     if any(q['skill'] not in {n['name'] for n in selected} for q in questions): raise HTTPException(502,'模型返回了未选择的技能题目，请重试。')
+    if data.unlock and (len(questions)<3 or len({q['question'] for q in questions})!=len(questions)):raise HTTPException(502,'节点考核需要至少3道不同题目，请重试。')
     current(request)
     with connect() as db:
         write_guard(db,user)
-        eid=db.execute('INSERT INTO exams(user_id,tree_id,content) VALUES (?,?,?)',(user['id'],data.tree_id,encode(questions))).lastrowid
+        eid=db.execute('INSERT INTO exams(user_id,tree_id,content,unlock_node) VALUES (?,?,?,?)',(user['id'],data.tree_id,encode(questions),selected[0]['id'] if data.unlock else None)).lastrowid
         event(db,user['id'],'exam_generate')
-    return exam_view(eid,questions)
+    return exam_view(eid,questions,data.unlock)
 
 
 class Answers(Input):
@@ -1270,6 +1289,18 @@ async def submit(eid:int,request:Request):
             else:
                 db.execute('UPDATE wrongbook SET correct_streak=correct_streak+1 WHERE user_id=? AND question=?',(user['id'],q['question']))
         result={'score':round(100*sum(x['correct'] for x in details)/len(details)),'details':details}
+        result.update(unlocked=[],tree_id=exam['tree_id'])
+        if exam['unlock_node'] and exam['tree_id']:
+            tree_row=owned(db,'trees',exam['tree_id'],user['id']);tree=json.loads(tree_row['content'])
+            skill=next((n for n in tree['nodes'] if n['id']==exam['unlock_node']),None)
+            done=set(json.loads(tree_row['assessment_progress']))
+            if (skill and len(details)>=3 and all(q['skill']==skill['name'] for q in details)
+                and sum(q['correct'] for q in details)/len(details)>=.8 and set(skill['prerequisites'])<=done):
+                done.add(skill['id']);result['unlocked']=[skill['id']]
+                db.execute('UPDATE trees SET assessment_progress=? WHERE id=?',(encode(sorted(done)),exam['tree_id']))
+                event(db,user['id'],'skill_exam_pass')
+            result['progress']=sorted(done)
+
         db.execute('UPDATE exams SET result=? WHERE id=?',(encode(result),eid));event(db,user['id'],'exam_submit')
     return result
 
@@ -1294,7 +1325,7 @@ async def get_exam(eid:int,request:Request):
     user=current(request)
     with connect() as db: exam=owned(db,'exams',eid,user['id'])
     if exam['result']: raise HTTPException(409,'该考试已经提交，请到个人中心查看结果。')
-    return exam_view(eid,json.loads(exam['content']))
+    return exam_view(eid,json.loads(exam['content']),bool(exam['unlock_node']))
 
 
 @router.delete('/profile/data')
@@ -1516,16 +1547,34 @@ class SkillNode(Strict):
     description: str = Field(min_length=1,max_length=400)
     prerequisites: list[str] = Field(max_length=6)
     task: str = Field(min_length=1,max_length=400)
+    stage: str = Field(default='专业技能',pattern=r'^(公共基础技能|职业方向|专业技能|项目实战)$')
+    resources: list[str] = Field(default_factory=lambda:['课程资料：待补充','实践文档：待补充'],min_length=1,max_length=5)
+
+
+class CareerNode(Strict):
+    id: str = Field(pattern=r'^[a-zA-Z0-9_-]{1,24}$')
+    name: str = Field(min_length=1,max_length=60)
+    description: str = Field(min_length=1,max_length=400)
+    core_skill_ids: list[str] = Field(min_length=1,max_length=64)
+    projects: list[str] = Field(min_length=1,max_length=5)
 
 
 class Tree(Strict):
+    learner_label: str = Field(default='学习者成长起点',min_length=1,max_length=100)
     title: str = Field(min_length=1,max_length=100)
     summary: str = Field(min_length=1,max_length=600)
-    nodes: list[SkillNode] = Field(min_length=1,max_length=24)
+    nodes: list[SkillNode] = Field(min_length=1,max_length=64)
+    careers: list[CareerNode] = Field(default_factory=list,max_length=12)
 
     @model_validator(mode='after')
     def validate_graph(self):
         nodes = {n.id:n for n in self.nodes}
+        if any(len(x)>200 for n in self.nodes for x in n.resources) or any(len(x)>400 for c in self.careers for x in c.projects):raise ValueError('resource or project too long')
+        if len({n.name for n in self.nodes})!=len(self.nodes):raise ValueError('duplicate skill name')
+        career_ids=[c.id for c in self.careers]
+        if len(set(career_ids))!=len(career_ids) or set(career_ids)&set(nodes) or 'student' in set(nodes)|set(career_ids):raise ValueError('duplicate graph id')
+        for career in self.careers:
+            if not set(career.core_skill_ids)<=set(nodes) or len(set(career.core_skill_ids))!=len(career.core_skill_ids):raise ValueError('unknown or duplicate career skill')
         if len(nodes) != len(self.nodes):
             raise ValueError('duplicate id')
         visited, visiting = set(), set()
@@ -1541,6 +1590,18 @@ class Tree(Strict):
             visited.add(nid)
         for nid in nodes:
             visit(nid)
+        if self.careers:
+            def ancestors(ids):
+                result=set()
+                def walk(nid):
+                    if nid in result:return
+                    result.add(nid)
+                    for pid in nodes[nid].prerequisites:walk(pid)
+                for nid in ids:walk(nid)
+                return result
+            paths=[ancestors(c.core_skill_ids) for c in self.careers]
+            if set.union(*paths)!=set(nodes):raise ValueError('skills without a career path')
+            if len(paths)>1 and not any(len([p for p in paths if nid in p])>1 for nid in nodes):raise ValueError('career paths must share skills')
         return self
 
 
@@ -1591,7 +1652,7 @@ def generate_json(task: str, data: dict, schema):
             reply = llm._deepseek_json('/chat/completions', {
                 'model':config.DEEPSEEK_MODEL,'messages':[{'role':'system','content':system},{'role':'user','content':encoded}],
                 'response_format':{'type':'json_object'},'thinking':{'type':'disabled'},
-                'temperature':0.35,'max_tokens':6000,'stream':False}, config.LLM_TIMEOUT)
+                'temperature':0.35,'max_tokens':10000 if schema is Tree else 6000,'stream':False}, config.LLM_TIMEOUT)
             choice=reply['choices'][0]
             if choice.get('finish_reason')!='stop' or choice['message'].get('tool_calls'):
                 raise ValueError('incomplete')
@@ -1615,6 +1676,43 @@ def generate_json(task: str, data: dict, schema):
         raise HTTPException(502,exc.safe_message) from None
     except Exception:
         raise HTTPException(502,'模型未返回合格的结构化结果，原记录保留，请重试。') from None
+```
+
+### `app/services/starmap.py`
+
+```python
+"""星图派生视图：状态与技能覆盖率由服务端计算，不采信模型给出的百分比。"""
+from copy import deepcopy
+
+
+def required_ids(tree,career):
+    nodes={n['id']:n for n in tree['nodes']};required=set()
+    def visit(nid):
+        if nid in required:return
+        required.add(nid)
+        for pid in nodes[nid]['prerequisites']:visit(pid)
+    for nid in career['core_skill_ids']:visit(nid)
+    return required
+
+
+def decorate(tree,progress,occupation='目标职业',major=''):
+    value=deepcopy(tree);done=set(progress)
+    value['learner_label']=(major+'学习者') if major else value.get('learner_label','学习者成长起点')
+    # 旧路线只具有单岗位，按原节点派生终点，不冒充新增AI结果。
+    if not value.get('careers'):
+        value['careers']=[{'id':'legacy-career','name':occupation,'description':value['summary'],
+                           'core_skill_ids':[n['id'] for n in value['nodes']],'projects':['完成路线中的综合实践任务']}]
+    counts={n['id']:0 for n in value['nodes']}
+    for career in value['careers']:
+        ids=required_ids(value,career);completed=ids&done
+        career.update(required_skill_ids=sorted(ids),required_count=len(ids),completed_count=len(completed),
+                      coverage=round(100*len(completed)/len(ids),1) if ids else 0,
+                      mastered=sorted(completed),missing=sorted(ids-done))
+        for nid in ids:counts[nid]+=1
+    for node in value['nodes']:
+        node['status']='completed' if node['id'] in done else 'available' if set(node['prerequisites'])<=done else 'locked'
+        node['shared_count']=counts[node['id']]
+    return value
 ```
 
 ### `app/vision_api.py`
@@ -2898,9 +2996,17 @@ execute(async()=>{await bootstrap();await refreshMaterials();if(state.materials.
 
 ```html
 <section class="view" id="view-tree" hidden>
-  <div class="page-heading"><div><h1>让每一步成长，都有路径<span class="heading-dot">.</span></h1><p>从目标岗位出发，AI 将能力要求铺成一张可探索、可实践、可检验的技能地图。</p></div><span class="badge green">职安 × 岗证</span></div>
-  <article class="panel"><div class="career-inputs"><div class="field"><label for="tree-occupation">目标职业</label><input id="tree-occupation" maxlength="100" placeholder="例如：Python 后端开发工程师"></div><div class="field"><label for="tree-saved">已保存路线</label><select id="tree-saved"><option value="">登录后查看个人技能树</option></select></div></div><div class="field"><label for="tree-jd">岗位描述与能力差距</label><textarea id="tree-jd" rows="3" maxlength="8000" placeholder="职业规划生成报告后会自动带入，也可直接填写目标岗位要求。"></textarea></div><label class="check-line"><input type="checkbox" id="tree-consent">同意将上述脱敏岗位内容和技能缺口发送到已配置的 AI，并将生成路线保存到个人账号。</label><div class="button-row"><button class="button primary" data-platform="generate-tree">AI 生成职业技能树 ↗</button><button class="button secondary" data-platform="load-trees">刷新我的路线</button></div><p class="fine-print" id="tree-state">先登录，再生成属于你的成长路线。生成失败会保留原路线。</p></article>
-  <div id="tree-workspace" hidden class="spaced"><div class="tree-banner"><div><h2 id="tree-title"></h2><p id="tree-summary"></p></div><div><strong id="tree-progress"></strong><p>自我记录 · 不代表能力认证</p></div></div><div class="tree-toolbar"><span>拖动空白浏览 · 点击节点查看详情</span><div class="button-row"><button class="button secondary small" data-platform="zoom-out" aria-label="缩小技能树">−</button><span id="tree-zoom">100%</span><button class="button secondary small" data-platform="zoom-in" aria-label="放大技能树">＋</button><button class="button secondary small" data-platform="zoom-reset">回到初始位置</button></div></div><div class="tree-layout"><div class="tree-scroll" id="tree-scroll" tabindex="0" aria-label="技能树画布，可拖动、单指滑动或方向键滚动，Escape关闭详情"><div id="tree-space"><div id="tree-scene"></div></div></div><aside class="panel tree-detail"><p id="node-empty" class="empty-mini">选择一个技能，查看介绍和学习要求。<br>点击画布空白处关闭详情。</p><div id="node-detail-content" hidden><h2 id="node-name">选择一个技能</h2><p id="node-description"></p><h3>前置技能</h3><p id="node-prerequisites"></p><h3>实践与交付物</h3><p id="node-task"></p><button class="button primary" data-platform="complete-node" id="node-complete">记录完成</button></div><div class="section-heading"><h3>考试范围</h3></div><p class="fine-print">勾选最多 8 个技能，AI 将围绕这些节点出题。</p><div id="node-selection" class="stack"></div><label class="check-line"><input type="checkbox" id="exam-consent">同意发送所选技能生成 AI 练习题。</label><button class="button secondary" data-platform="generate-exam">生成技能考试 →</button></aside></div></div>
+  <div class="star-heading"><div><p class="star-kicker">从能力出发，向未来进阶</p><h1>职业成长星图<span>✦</span></h1><p>公共基础技能 → 职业方向 → 专业技能 → 项目实战 → 目标职业</p></div><div class="star-mode-switch" role="group" aria-label="星图数据模式"><button type="button" data-star="live" aria-pressed="true">我的 AI 星图</button><button type="button" data-star="demo" aria-pressed="false">探索演示</button></div></div>
+  <details id="tree-config" class="star-config"><summary>✧ 由 AI 定制职业路径<span id="star-source">根据专业、岗位与能力差距动态生成</span></summary><div class="star-config-body"><div class="field"><label for="tree-major">专业 / 学习领域</label><input id="tree-major" maxlength="80" placeholder="适用任意专业，例如：视觉传达设计、电子商务、机械制造、护理"></div><div class="career-inputs"><div class="field"><label for="tree-occupation">目标职业 / 探索方向（可选）</label><input id="tree-occupation" maxlength="100" placeholder="例如：品牌设计、财务分析、机械设计；可由 AI 结合专业探索"></div><div class="field"><label for="tree-saved">已保存星图</label><select id="tree-saved"><option value="">选择个人星图</option></select></div></div><div class="field"><label for="tree-jd">岗位要求与能力差距</label><textarea id="tree-jd" rows="3" maxlength="8000" placeholder="从职业规划带入，也可填写希望探索的方向和已有基础。职业数量由 AI 根据内容生成。"></textarea></div><label class="check-line"><input type="checkbox" id="tree-consent">同意将上述脱敏内容发送给已配置的 AI，生成并保存个人技能星图。</label><div class="button-row"><button class="button primary" data-platform="generate-tree">AI 生成职业技能树 ↗</button><button class="button secondary" data-platform="load-trees">刷新我的星图</button></div><p class="fine-print" id="tree-state">通过节点考核积累技能，不代表职业认证或招聘录用。</p></div></details>
+  <div id="tree-workspace" class="star-workspace spaced">
+    <div class="star-hud"><div class="star-level"><span id="star-level">LV.01</span><div><strong id="tree-title">等待点亮的成长宇宙</strong><p id="star-level-name">学习者成长起点</p></div></div><div class="star-hud-progress"><div><span>技能进度</span><strong id="tree-progress">0 / 0</strong></div><div class="star-progress-track"><i id="star-progress-fill"></i></div></div><div class="star-hud-count"><strong id="star-career-count">—</strong><span>职业方向</span></div><span class="star-mode-tag" id="star-mode-tag">AI 个人星图</span></div>
+    <div class="star-main"><div class="star-map-shell"><div class="star-map-top"><div><strong id="star-focus-label">职业总览</strong><span id="tree-summary">每一项能力，连接不止一种可能。</span></div><div class="star-display-actions"><button type="button" id="star-dependency-toggle" class="star-dependency-toggle" data-star="dependencies" aria-pressed="false" disabled>完整依赖</button><button type="button" class="star-text-button" data-star="overview">返回职业总览 ↗</button></div></div>
+      <div id="star-stage-list" class="star-stage-list" role="group" aria-label="展开技能阶段" hidden></div><div class="tree-scroll star-viewport" id="tree-scroll" tabindex="0" aria-label="职业成长星图，可拖动或单指滑动，方向键浏览，Home居中，Escape关闭详情"><div id="tree-space"><div id="tree-scene"></div></div></div>
+      <div class="star-map-bottom"><div class="star-legend"><span><i class="locked"></i>未解锁</span><span><i class="available"></i>可学习</span><span><i class="completed"></i>已完成</span></div><div class="star-zoom"><button type="button" data-star="zoom-out" aria-label="缩小星图">−</button><span id="tree-zoom">100%</span><button type="button" data-star="zoom-in" aria-label="放大星图">＋</button><button type="button" data-star="center">画布居中</button><button type="button" data-star="arrange">重新排布</button></div></div>
+      <p class="star-gesture-hint">空白拖动画布 · 节点可拖动 · 滚轮缩放</p><div id="star-achievement" class="star-achievement" role="status" aria-live="polite" hidden></div>
+    </div><aside class="star-panel" aria-label="职业与技能详情"><div class="star-panel-top"><span id="star-panel-label">成长导航</span><button type="button" data-star="clear" aria-label="关闭节点详情">×</button></div><div id="star-detail-body"></div></aside></div>
+    <div id="star-demo-actions" class="star-demo-bar" hidden><div><strong>演示模式</strong><span>预置九大方向 · 进度仅用于本次演示</span></div><div class="button-row"><button type="button" class="button primary" data-star="sample">一键加载成长进度</button><button type="button" class="button secondary" data-star="reset">重置演示</button><button type="button" class="button secondary" data-star="live">回到我的星图</button></div></div>
+  </div>
 </section>
 <section class="view" id="view-exam" hidden>
   <div class="page-heading"><div><h1>用一次练习，找到下一步<span class="heading-dot">.</span></h1><p>根据技能树所选节点生成题目。提交后显示解析，错题自动进入个人错题本。</p></div><button class="button secondary" data-go="tree">选择技能 ↗</button></div><article class="panel"><p class="fine-print" id="exam-meta">还没有进行中的考试。请从技能树出题，或在个人中心随机抽取错题。</p><div id="exam-questions" class="stack"></div><button class="button primary" data-platform="submit-exam" id="exam-submit" hidden>提交并查看解析</button><div id="exam-result" class="spaced" aria-live="polite"></div></article>
@@ -2926,7 +3032,7 @@ execute(async()=>{await bootstrap();await refreshMaterials();if(state.materials.
 ```javascript
 'use strict';
 // 原生界面扩展。所有用户和模型内容以 textContent 渲染。
-const platform={user:null,tree:null,selected:null,zoom:1,jobs:[],exam:null,interview:null,reviewJob:null,
+const platform={user:null,tree:null,jobs:[],exam:null,interview:null,reviewJob:null,
   skills:[],pending:false,recognition:null,listening:false,voiceTimer:null,silenceTimer:null,voiceEpoch:0,interviewEpoch:0};
 const extTitles={tree:'职业技能树',exam:'技能考试',interview:'AI 面试',jobs:'岗位推荐',profile:'个人中心'};
 Object.assign(titles,extTitles);
@@ -2938,7 +3044,7 @@ async function platformRun(fn,b){
   if(platform.pending)return;
   platform.pending=true;if(b){b.disabled=true;b.setAttribute('aria-busy','true');}
   try{await fn();}catch(e){if(e.name!=='AbortError')toast(e.message||'操作未完成，请重试。',true);}
-  finally{platform.pending=false;if(b){b.disabled=false;b.removeAttribute('aria-busy');if(b.id==='node-complete'&&platform.tree)renderNode();}}
+  finally{platform.pending=false;if(b){b.disabled=false;b.removeAttribute('aria-busy');}}
 }
 function signed(){if(!platform.user){location.href='/login';throw Error('请先登录。');}}
 function consentChecked(id){if(!$(id).checked)throw Error('请先勾选本次 AI 数据发送说明。');}
@@ -2964,9 +3070,9 @@ async function logout(){
   location.assign('/');
 }
 function resetPlatform(){
-  platform.editJob=null;window.CameraAssist?.stop();
+  platform.editJob=null;window.CameraAssist?.stop();window.StarMap?.clearAll();
   stopVoice();platform.interviewEpoch++;platform.tree=null;platform.exam=null;platform.interview=null;platform.skills=[];
-  ['#profile-occupation','#profile-resume','#tree-occupation','#tree-jd','#interview-occupation','#interview-jd','#interview-answer','#voice-interim','#review-body','#admin-key'].forEach(s=>{const el=$(s);if(el){if('value'in el)el.value='';else el.textContent='';}});
+  ['#profile-occupation','#profile-resume','#tree-major','#tree-occupation','#tree-jd','#interview-occupation','#interview-jd','#interview-answer','#voice-interim','#review-body','#admin-key'].forEach(s=>{const el=$(s);if(el){if('value'in el)el.value='';else el.textContent='';}});
   ['#tree-scene','#node-selection','#exam-questions','#exam-result','#wrongbook-list','#interview-history','#exam-history','#profile-materials','#profile-reports','#interview-messages','#admin-metrics','#admin-users','#admin-reviews','#admin-jobs','#review-list'].forEach(s=>$(s)?.replaceChildren());
   document.querySelectorAll('#view-tree input[type=checkbox],#view-interview input[type=checkbox]').forEach(el=>el.checked=false);
   $('#tree-workspace').hidden=true;$('#exam-submit').hidden=true;$('#tree-saved').replaceChildren(new Option('选择个人路线',''));
@@ -3003,65 +3109,19 @@ async function loadTrees(){
   const data=await api('/learning/trees');const select=$('#tree-saved'),old=String(platform.tree?.id||'');
   select.replaceChildren(new Option('选择已保存的路线',''));data.items.forEach(t=>select.append(new Option(t.occupation+' · '+t.tree.nodes.length+' 个技能',String(t.id))));
   platform.savedTrees=data.items;if(old)select.value=old;
-  if(!platform.tree&&data.items.length)renderTree(data.items[0]);
+  if(!platform.tree&&window.StarMap.mode!=='demo'&&data.items.length)renderTree(data.items[0]);
 }
 async function generateTree(){
-  signed();consentChecked('#tree-consent');const occupation=$('#tree-occupation').value.trim();if(!occupation)throw Error('请填写目标职业。');
+  signed();consentChecked('#tree-consent');const major=$('#tree-major').value.trim(),occupation=$('#tree-occupation').value.trim()||(major?major+'相关职业探索':'');if(!occupation)throw Error('请填写专业或目标职业。');
   text('#tree-state','AI 正在铺设技能路径…原路线保留。');
-  try{const result=await api('/learning/tree',{method:'POST',data:{occupation,jd:$('#tree-jd').value.trim(),skills:platform.skills,consent:true}});renderTree(result);await loadTrees();toast('已生成并保存 AI 技能树。');}
+  try{const result=await api('/learning/tree',{method:'POST',data:{major,occupation,jd:$('#tree-jd').value.trim(),skills:platform.skills,consent:true}});renderTree(result);await loadTrees();toast('已生成并保存 AI 技能树。');}
   catch(error){text('#tree-state',error.message+' 原路线仍保留，可重试。');throw error;}
-  if(platform.tree)text('#tree-state','AI 生成路线为学习参考。完成状态为自我记录，可选择节点进行练习检验。');
+  if(platform.tree)text('#tree-state','AI 生成路线为学习参考。须通过节点考核才能解锁后续技能。');
 }
-function treePositions(tree){
-  const layers=new Map();const map=new Map(tree.nodes.map(n=>[n.id,n]));
-  function depth(n){if(layers.has(n.id))return layers.get(n.id);const d=n.prerequisites.length?1+Math.max(...n.prerequisites.map(id=>depth(map.get(id)))):0;layers.set(n.id,d);return d;}
-  const counts=new Map();return tree.nodes.map(n=>{const d=depth(n),i=counts.get(d)||0;counts.set(d,i+1);return {...n,x:40+d*260,y:45+i*145};});
-}
-function skillStatus(n){return platform.tree.progress.includes(n.id)?'completed':n.prerequisites.every(id=>platform.tree.progress.includes(id))?'available':'locked';}
 function renderTree(value){
-  platform.canvas?.cancel();platform.tree=value;platform.selected=null;platform.zoom=1;$('#tree-workspace').hidden=false;
-  text('#tree-title',value.tree.title);text('#tree-summary',value.tree.summary);$('#tree-occupation').value=value.occupation;$('#tree-jd').value=value.jd;
-  $('#tree-saved').value=String(value.id);$('#node-selection').replaceChildren();
-  text('#tree-state','已载入个人路线。完成状态为自我记录，技能考试可帮助发现仍需巩固的部分。');
-  drawTree();$('#tree-scroll').scrollTo(0,0);
+  platform.tree=value;$('#tree-major').value=value.major||'';$('#tree-occupation').value=value.occupation;$('#tree-jd').value=value.jd;$('#tree-saved').value=String(value.id);window.StarMap.load(value);
 }
-function drawTree(){
-  if(!platform.tree)return;
-  const tree=platform.tree.tree,positions=treePositions(tree),width=Math.max(760,...positions.map(n=>n.x+240)),height=Math.max(480,...positions.map(n=>n.y+135));
-  platform.canvas?.cancel();const scene=$('#tree-scene');scene.replaceChildren();scene.style.width=width+'px';scene.style.height=height+'px';scene.style.transform=`scale(${platform.zoom})`;
-  $('#tree-space').style.width=width*platform.zoom+'px';$('#tree-space').style.height=height*platform.zoom+'px';
-  const ns='http://www.w3.org/2000/svg',svg=document.createElementNS(ns,'svg');svg.setAttribute('width',width);svg.setAttribute('height',height);svg.setAttribute('aria-hidden','true');
-  positions.forEach(n=>n.prerequisites.forEach(id=>{const p=positions.find(n=>n.id===id),line=document.createElementNS(ns,'path');line.dataset.from=id;line.dataset.to=n.id;line.setAttribute('d',`M${p.x+195},${p.y+45} C${p.x+230},${p.y+45} ${n.x-35},${n.y+45} ${n.x},${n.y+45}`);svg.append(line);}));scene.append(svg);
-  positions.forEach(n=>{const b=node('button','skill-node '+skillStatus(n)+(n.id===platform.selected?' selected':''));b.type='button';b.dataset.skillId=n.id;b.style.left=n.x+'px';b.style.top=n.y+'px';b.setAttribute('aria-pressed',String(n.id===platform.selected));b.append(node('strong','',n.name),node('small','',skillStatus(n)==='completed'?'✓ 已完成':skillStatus(n)==='locked'?'○ 待完成前置技能':'✦ 可以开始学习'));scene.append(b);});
-  text('#tree-progress',`${platform.tree.progress.length} / ${tree.nodes.length} 项 · ${Math.round(platform.tree.progress.length/tree.nodes.length*100)}%`);text('#tree-zoom',Math.round(platform.zoom*100)+'%');selectSkill(platform.selected);
-  // 范围选择在重绘时保持，避免缩放或选择节点丢失出题范围。
-  const checked=new Set([...document.querySelectorAll('#node-selection input:checked')].map(x=>x.value));const list=$('#node-selection');list.replaceChildren();
-  tree.nodes.forEach(n=>{const label=node('label','check-line'),check=node('input');check.type='checkbox';check.value=n.id;check.checked=checked.has(n.id);label.append(check,document.createTextNode(n.name));list.append(label);});
-}
-function selectSkill(id){
-  platform.selected=id;
-  document.querySelectorAll('#tree-scene .skill-node').forEach(b=>{const active=b.dataset.skillId===id;b.classList.toggle('selected',active);b.setAttribute('aria-pressed',String(active));});
-  document.querySelectorAll('#tree-scene path').forEach(p=>p.classList.toggle('emphasized',Boolean(id)&&(p.dataset.from===id||p.dataset.to===id)));
-  renderNode();
-}
-function renderNode(){
-  const n=platform.tree?.tree.nodes.find(n=>n.id===platform.selected);
-  $('#node-detail-content').hidden=!n;$('#node-empty').hidden=Boolean(n);if(!n)return;
-  text('#node-name',n.name);text('#node-description',n.description);text('#node-task',n.task);
-  text('#node-prerequisites',n.prerequisites.map(id=>platform.tree.tree.nodes.find(n=>n.id===id).name).join('、')||'无前置要求，可以从这里开始。');
-  const locked=skillStatus(n)==='locked';$('#node-complete').disabled=locked;text('#node-complete',locked?'先完成前置技能':skillStatus(n)==='completed'?'撤销完成及后续进度':'记录实践完成');
-}
-async function completeNode(){
-  signed();const selected=platform.selected;if(!selected)return;let done=new Set(platform.tree.progress);
-  if(done.has(selected)){done.delete(selected);let changed=true;while(changed){changed=false;platform.tree.tree.nodes.forEach(n=>{if(done.has(n.id)&&n.prerequisites.some(p=>!done.has(p))){done.delete(n.id);changed=true;}});}}
-  else done.add(selected);
-  const result=await api('/learning/trees/'+platform.tree.id+'/progress',{method:'PUT',data:{completed:[...done]}});platform.tree.progress=result.completed;drawTree();toast('已更新个人实践进度。');
-}
-async function generateExam(){
-  signed();if(!platform.tree)throw Error('请先生成技能树。');consentChecked('#exam-consent');
-  const ids=[...document.querySelectorAll('#node-selection input:checked')].map(x=>x.value);if(!ids.length||ids.length>8)throw Error('请选择 1–8 个技能。');
-  toast('AI 正在围绕所选技能生成题目…');const result=await api('/learning/exams',{method:'POST',data:{tree_id:platform.tree.id,node_ids:ids,consent:true}});renderExam(result);show('exam');
-}
+function selectSkill(id){if(id)window.StarMap.select(id);else window.StarMap.clear();}
 function renderExam(exam){
   platform.exam=exam;const root=$('#exam-questions');root.replaceChildren();$('#exam-result').replaceChildren();$('#exam-submit').hidden=false;
   text('#exam-meta',`${exam.questions.length} 道单选题 · ${exam.source}`);
@@ -3072,6 +3132,8 @@ async function submitExam(){
   const answers=platform.exam.questions.map((_,i)=>{const el=$(`input[name="answer-${i}"]:checked`);return el?Number(el.value):-1;});if(answers.includes(-1))throw Error('请完成每一道题。');
   const result=await api('/learning/exams/'+platform.exam.id+'/submit',{method:'POST',data:{answers}});$('#exam-submit').hidden=true;$('#exam-questions').querySelectorAll('input').forEach(el=>el.disabled=true);
   const root=$('#exam-result');root.replaceChildren(node('h2','',`${result.score} 分 · 本次练习反馈`));
+  await window.StarMap.applyExam(result);
+  if(result.tree_id){root.append(node('p','fine-print',result.unlocked?.length?'节点考核通过，技能已点亮，前置满足的后续技能已解锁。':'本次未新增技能完成记录。节点考核须满足至少3题、正确率80%与前置要求。'),button('返回职业成长星图',()=>show('tree')));}
   result.details.forEach((q,i)=>{const card=node('article','answer-feedback'+(q.correct?'':' wrong'));card.append(node('strong','',`${i+1}. ${q.correct?'回答正确':'已加入错题本'}`),node('p','',`你的选择：${'ABCD'[q.chosen]} · 参考答案：${'ABCD'[q.answer]}`),node('p','',q.explanation));root.append(card);});
   root.append(node('p','fine-print','AI 生成的题目和解析可能有误，请结合课程资料核对。本分数仅代表本次练习。'));toast('考试已提交，答错的题目已自动收集。');
 }
@@ -3155,9 +3217,8 @@ function inheritCareer(result,jd){
 }
 
 const platformHandlers={logout,'save-profile':saveProfile,'use-profile':useProfile,
-  'refresh-profile':async()=>{signed();await loadProfile();},'generate-tree':generateTree,'load-trees':loadTrees,'complete-node':completeNode,
-  'zoom-in':()=>{platform.zoom=Math.min(1.6,platform.zoom+.1);drawTree();},'zoom-out':()=>{platform.zoom=Math.max(.4,platform.zoom-.1);drawTree();},'zoom-reset':()=>{platform.zoom=1;drawTree();$('#tree-scroll').scrollTo(0,0);},
-  'generate-exam':generateExam,'submit-exam':submitExam,practice,'load-jobs':loadJobs,'publish-job':publishJob,'save-review':saveReview,
+  'refresh-profile':async()=>{signed();await loadProfile();},'generate-tree':generateTree,'load-trees':loadTrees,
+  'submit-exam':submitExam,practice,'load-jobs':loadJobs,'publish-job':publishJob,'save-review':saveReview,
   'start-interview':startInterview,'send-answer':sendAnswer,'end-interview':endInterview,listen,interrupt:()=>{stopVoice();text('#voice-status','已停止听写与朗读，文字仍可编辑。');},
   'erase-learning':async()=>{signed();if(!confirm('删除当前账号的材料、档案、职业报告、技能树、考试、错题与面试记录？此操作不可恢复，已发布岗位和点评保留。'))return;stopVoice();platform.interviewEpoch++;await api('/profile/data',{method:'DELETE'});resetPlatform();await loadProfile();toast('个人档案和学习记录已删除。');}
 };
@@ -3177,7 +3238,8 @@ async function initPlatform(){
   document.addEventListener('click',event=>{const b=event.target.closest('[data-platform]');if(!b||!platformHandlers[b.dataset.platform])return;
     if(['interrupt','end-interview'].includes(b.dataset.platform)){Promise.resolve(platformHandlers[b.dataset.platform]()).catch(e=>toast(e.message,true));return;}
     platformRun(platformHandlers[b.dataset.platform],b);});
-  platform.canvas=window.TreeCanvas.attach($('#tree-scroll'),{onSelect:selectSkill,onClear:()=>selectSkill(null)});
+  window.StarMap.init();
+  platform.canvas=window.TreeCanvas.attach($('#tree-scroll'),{onSelect:selectSkill,onClear:()=>selectSkill(null),onNodeDragMove:window.StarMap.dragNode,onNodeDragEnd:window.StarMap.endNodeDrag,onZoom:window.StarMap.wheelZoom});
   $('#tree-saved').addEventListener('change',()=>{const tree=platform.savedTrees?.find(t=>String(t.id)===$('#tree-saved').value);if(tree)renderTree(tree);});
   $('#job-search').addEventListener('input',renderJobs);
   $('#interview-answer').addEventListener('keydown',e=>{if(e.ctrlKey&&e.key==='Enter'){e.preventDefault();platformRun(sendAnswer);}});
@@ -3199,10 +3261,11 @@ initPlatform().catch(e=>toast(e.message,true));
 ```javascript
 /* 单指/鼠标共享手势：浏览器原生滚动负责裁剪和绘制，不逐帧重建节点。 */
 window.TreeCanvas={
-  attach(viewport,{onSelect,onClear}){
+  attach(viewport,{onSelect,onClear,onNodeDragMove,onNodeDragEnd,onZoom}){
     let gesture=null,suppressClick=false,blocked=false;const pointers=new Set();
     function cancel(){
-      const id=gesture?.id;gesture=null;viewport.classList.remove('dragging');
+      const id=gesture?.id,interrupted=gesture;gesture=null;viewport.classList.remove('dragging');viewport.classList.remove('dragging-node');
+      if(interrupted?.nodeDrag){onNodeDragEnd?.(interrupted.node,true);}
       if(id!==undefined&&viewport.hasPointerCapture(id))viewport.releasePointerCapture(id);
     }
     viewport.addEventListener('pointerdown',event=>{
@@ -3220,7 +3283,9 @@ window.TreeCanvas={
       if(!gesture||gesture.id!==event.pointerId||blocked)return;
       const dx=event.clientX-gesture.x,dy=event.clientY-gesture.y;
       if(!gesture.dragged&&Math.hypot(dx,dy)<6)return;
-      gesture.dragged=true;suppressClick=true;viewport.classList.add('dragging');event.preventDefault();
+      gesture.dragged=true;suppressClick=true;event.preventDefault();
+      if(gesture.node&&onNodeDragMove){gesture.nodeDrag=true;viewport.classList.add('dragging-node');onNodeDragMove(gesture.node,dx,dy);return;}
+      viewport.classList.add('dragging');
       viewport.scrollLeft=Math.max(0,Math.min(viewport.scrollWidth-viewport.clientWidth,gesture.left-dx));
       viewport.scrollTop=Math.max(0,Math.min(viewport.scrollHeight-viewport.clientHeight,gesture.top-dy));
     });
@@ -3230,7 +3295,9 @@ window.TreeCanvas={
       if(gesture?.id===event.pointerId){
         const moved=Math.hypot(event.clientX-gesture.x,event.clientY-gesture.y)>=6;
         suppressClick=suppressClick||moved||cancelled;
-        clickedNode=gesture.node;hasPointerClick=!cancelled;cancel();
+        clickedNode=gesture.node;hasPointerClick=!cancelled;
+        if(gesture.nodeDrag){gesture.nodeDrag=false;onNodeDragEnd?.(gesture.node,cancelled);}
+        cancel();
       }
       pointers.delete(event.pointerId);if(!pointers.size)blocked=false;
     }
@@ -3242,10 +3309,371 @@ window.TreeCanvas={
       const id=event.detail!==0&&hasPointerClick?clickedNode:event.target.closest('[data-skill-id]')?.dataset.skillId;
       hasPointerClick=false;if(id)onSelect(id);else onClear();
     },true);
+    viewport.addEventListener('wheel',event=>{if(!onZoom||!Number.isFinite(event.deltaY))return;event.preventDefault();onZoom({deltaY:event.deltaY*(event.deltaMode===1?16:event.deltaMode===2?viewport.clientHeight:1),clientX:event.clientX,clientY:event.clientY});},{passive:false});
     viewport.addEventListener('keydown',event=>{if(event.key==='Escape'){onClear();viewport.focus();}});
     return {cancel(){suppressClick=true;hasPointerClick=false;cancel();pointers.clear();blocked=false;}};
   }
 };
+```
+
+### `static/star-graph.js`
+
+```javascript
+/* 共享图算法与匿名演示课程。职业数由数据决定，九方向仅存在于演示课程。 */
+window.StarGraph=(()=>{
+  const stages=['公共基础技能','职业方向','专业技能','项目实战'];
+  function required(graph,career){const map=new Map(graph.nodes.map(n=>[n.id,n])),out=new Set();function visit(id){if(out.has(id)||!map.has(id))return;out.add(id);map.get(id).prerequisites.forEach(visit);}career.core_skill_ids.forEach(visit);return out;}
+  function decorate(graph,progress){const done=new Set(progress),g=JSON.parse(JSON.stringify(graph));g.nodes.forEach(n=>{n.status=done.has(n.id)?'completed':n.prerequisites.every(id=>done.has(id))?'available':'locked';n.shared_count=0;});g.careers.forEach(c=>{const ids=required(g,c);c.required_skill_ids=[...ids];c.mastered=[...ids].filter(id=>done.has(id));c.missing=[...ids].filter(id=>!done.has(id));c.required_count=ids.size;c.completed_count=c.mastered.length;c.coverage=ids.size?Math.round(c.completed_count/ids.size*1000)/10:0;g.nodes.forEach(n=>{if(ids.has(n.id))n.shared_count++;});});return g;}
+  function layout(graph,focus=null){
+    const cx=950,cy=850,points=new Map(),career=graph.careers.find(c=>c.id===focus);
+    const visible=career?required(graph,career):new Set(graph.nodes.filter(n=>n.stage===stages[0]).slice(0,6).map(n=>n.id));
+    stages.forEach((stage,layer)=>{const nodes=graph.nodes.filter(n=>visible.has(n.id)&&(n.stage||stages[2])===stage);nodes.forEach((n,i)=>{const angle=-Math.PI/2+i*2*Math.PI/Math.max(nodes.length,1)+(career?layer*.85:0),radius=career?[250,350,470,580][layer]:260;points.set(n.id,{x:cx+Math.cos(angle)*radius,y:cy+Math.sin(angle)*radius,kind:'skill'});});});
+    graph.careers.filter(c=>!career||c.id===focus).forEach(c=>{const i=graph.careers.findIndex(x=>x.id===c.id),angle=-Math.PI/2+i*2*Math.PI/graph.careers.length;points.set(c.id,{x:cx+Math.cos(angle)*640,y:cy+Math.sin(angle)*640,kind:'career'});});
+    points.set('student',{x:cx,y:cy,kind:'student'});return {width:1900,height:1700,cx,cy,points,visible,focus:career};
+  }
+  // 以屏幕尺寸校验间隔，不因节点标签的逆缩放而挤到一起。
+  function overlaps(a,b,zoom){return Math.abs(a.x-b.x)*zoom<144&&Math.abs(a.y-b.y)*zoom<138;}
+  function freePosition(point,others,zoom){
+    const marginX=85/zoom,marginY=45/zoom;
+    for(let k=0;k<1000;k++){
+      const angle=k*2.399963229728653,radius=19*Math.sqrt(k)/zoom;
+      const p={...point,x:Math.max(marginX,point.x+Math.cos(angle)*radius),y:Math.max(marginY,point.y+Math.sin(angle)*radius)};
+      if(others.every(other=>!overlaps(p,other,zoom)))return p;
+    }
+    return {...point,x:Math.max(marginX,...others.map(p=>p.x+160/zoom)),y:Math.max(marginY,point.y)};
+  }
+  function separate(layout,zoom,overrides=new Map(),shown=null){
+    const output={...layout,points:new Map([...layout.points].map(([id,p])=>[id,{...p}]))},placed=[];
+    const entries=[...output.points].filter(([id])=>!shown||shown.has(id)).sort(([a,x],[b,y])=>Number(overrides.has(b))-Number(overrides.has(a))||({student:0,career:1,skill:2}[x.kind]-{student:0,career:1,skill:2}[y.kind]));
+    for(const [id,original] of entries){const candidate={...original,...overrides.get(id)},p=freePosition(candidate,placed,zoom);output.points.set(id,p);placed.push(p);output.width=Math.max(output.width,p.x+90/zoom);output.height=Math.max(output.height,p.y+100/zoom);}
+    return output;
+  }
+  function demo(){
+    const nodes=[];const add=(id,name,stage,prerequisites,description,task)=>nodes.push({id,name,stage,prerequisites,description,task,resources:['课程资料：待补充','实践文档：待补充']});
+    add('cs','计算机基础',stages[0],[],'理解计算机组成、操作系统与数据表示。','制作一次程序从输入到输出的执行流程图。');
+    add('code','程序设计',stages[0],['cs'],'掌握变量、控制流程、函数和数据结构。','交付一个带异常处理的命令行工具。');
+    add('git','Git 协作',stages[0],['cs'],'理解版本、分支、合并和协作评审。','用分支开发并提交一次带测试记录的合并。');
+    add('net','网络基础',stages[0],['cs'],'理解TCP/IP、DNS、HTTP与请求响应。','解释一次请求的路径并绘制协议交互图。');
+    add('db','数据与 SQL',stages[0],['code'],'理解关系数据、SQL查询、索引与事务。','交付有主外键约束的数据库与查询脚本。');
+    add('http','HTTP 与接口',stages[2],['net','code'],'设计可验证的接口输入、状态码和错误响应。','编写接口契约与错误处理测试。');
+    add('linux','Linux 运维',stages[2],['net','git'],'管理进程、权限、日志与服务运行环境。','交付服务部署清单与排错记录。');
+    add('python','Python 数据工具',stages[2],['code','db'],'使用Python进行结构化数据处理与验证。','交付包含校验与单元测试的数据处理程序。');
+    const specs=[
+      ['frontend','前端开发','构建清晰、可访问的交互界面。','Web 交互工程',['http','git'],'实现响应式界面、状态管理和可访问交互。','交付具有加载、空态、错误态的Web应用。'],
+      ['backend','后端开发','设计稳定的业务接口与数据服务。','服务端工程',['http','db'],'实现鉴权、事务、分页和异常处理。','交付带接口文档与测试的服务。'],
+      ['data','数据分析','把数据转化为可解释的业务发现。','分析与可视化',['python','db'],'清洗数据、建立指标并解释分析限制。','交付可复现的数据分析与图表报告。'],
+      ['ai','AI 应用开发','将模型能力接入可靠的应用流程。','模型应用工程',['python','http'],'构建检索、结构化输出与效果评估。','交付带证据引用与失败降级的AI助手。'],
+      ['security','网络安全','分析风险并建设可验证的安全防护。','安全防护工程',['linux','http'],'完成输入校验、权限设计与安全测试。','交付受控环境安全测试和修复验证报告。'],
+      ['cloud','云计算运维','构建可观测、可恢复的服务环境。','容器与服务运维',['linux','http'],'完成容器化、监控告警和恢复演练。','交付部署配置、监控和回滚记录。'],
+      ['qa','软件测试','用系统化验证提高交付质量。','自动化测试工程',['python','http'],'设计边界用例与自动化回归流程。','交付覆盖正常、边界与异常路径的测试套件。'],
+      ['mobile','移动应用','打造适应设备与触控的移动体验。','移动端工程',['http','git'],'实现移动页面、离线状态与生命周期管理。','交付可在窄屏操作的移动应用。'],
+      ['iot','物联网开发','连接设备、数据与业务服务。','设备与协议工程',['linux','code'],'处理设备消息、连接重试和数据上报。','交付设备仿真、协议说明与故障恢复演示。']];
+    const careers=specs.map(([id,name,description,skill,deps,content,task])=>{
+      const direction='dir_'+id,professional='skill_'+id,project='proj_'+id;
+      add(direction,name+'方向',stages[1],['code','git'],'了解'+name+'的工作任务、交付方式与能力边界。','完成一份岗位能力与学习目标清单。');
+      add(professional,skill,stages[2],[direction,...deps],content,task);
+      add(project,'项目：'+name,stages[3],[professional,'git'],'综合运用已学技能，形成可演示、可复现的成果。',task+'包含README、测试记录与成果说明。');
+      return {id:'career_'+id,name,description,core_skill_ids:[project],projects:[task]};
+    });
+    return {learner_label:'计算机专业学习者（演示）',title:'计算机专业 · 职业成长星图',summary:'从共享基础出发，在交汇的技能路径中探索九大职业。',nodes,careers};
+  }
+  return {stages,required,decorate,layout,demo,overlaps,freePosition,separate};
+})();
+```
+
+### `static/star-display.js`
+
+```javascript
+/* 纯显示规划：不修改技能、前置关系或考核进度。导航线与真实依赖明确分开。 */
+window.StarDisplay={
+  nextExpanded(current,index,effectiveOpen){const next=new Set(current);effectiveOpen?next.delete(index):next.add(index);return [...next];},
+  plan(graph,{focus=null,selected=null,full=false,expanded=[]}={}){
+    const G=window.StarGraph,career=graph.careers.find(c=>c.id===focus),skillIds=new Set(),groups=[],edges=[];
+    const link=(from,to,navigation=false)=>edges.push({from,to,navigation});
+    if(!career){graph.careers.forEach(c=>link('student',c.id,true));return {skillIds,groups,edges};}
+    const required=G.required(graph,career),nodes=graph.nodes.filter(n=>required.has(n.id)),chosen=nodes.find(n=>n.id===selected);
+    if(full){
+      nodes.forEach(n=>{skillIds.add(n.id);if(!n.prerequisites.length)link('student',n.id,true);n.prerequisites.forEach(id=>link(id,n.id));});
+      const parents=new Set(nodes.flatMap(n=>n.prerequisites));nodes.filter(n=>!parents.has(n.id)).forEach(n=>link(n.id,career.id,true));
+      return {skillIds,groups,edges};
+    }
+    const open=new Set(expanded);
+    if(chosen){
+      open.add(G.stages.indexOf(chosen.stage));skillIds.add(chosen.id);
+      chosen.prerequisites.forEach(id=>{skillIds.add(id);link(id,chosen.id);});
+      nodes.filter(n=>n.prerequisites.includes(chosen.id)).forEach(n=>{skillIds.add(n.id);link(chosen.id,n.id);});
+      if(!chosen.prerequisites.length)link('student',chosen.id,true);
+      if(!nodes.some(n=>n.prerequisites.includes(chosen.id)))link(chosen.id,career.id,true);
+    }
+    G.stages.forEach((stage,index)=>{
+      const members=nodes.filter(n=>n.stage===stage);if(!members.length)return;
+      if(open.has(index))members.forEach(n=>skillIds.add(n.id));
+      groups.push({id:'@stage:'+index,stage,index,count:members.length,expanded:open.has(index),hiddenCount:0});
+    });
+    groups.forEach(g=>g.hiddenCount=nodes.filter(n=>n.stage===g.stage&&!skillIds.has(n.id)).length);
+    if(!chosen){let previous='student';groups.forEach(group=>{link(previous,group.id,true);previous=group.id;});link(previous,career.id,true);}
+    return {skillIds,groups,edges};
+  }
+};
+```
+
+### `static/starmap.js`
+
+```javascript
+/* 星图视图：正式模式使用服务器考试进度；演示模式只修改本页内存。 */
+window.StarMap=(()=>{
+  const palette=['#87adf2','#b19cea','#74c8bd','#a6a1ee','#d1a1bb','#8ebbd3','#aecb93','#c6ad89','#92a5d7'];
+  const glyphs=['⌘','⬡','▥','✦','◇','☁','✓','▯','⌁'];
+  const S={mode:'live',graph:null,progress:[],focus:null,selected:null,zoom:1,layout:null,initialized:false,achievementTimer:null,pendingAchievements:[],positions:new Map(),drag:null,dragFrame:0,wheelFrame:0,wheelDelta:0,settleTimer:0,full:false,expanded:new Set(),display:null};
+  const get=id=>document.getElementById(id),el=(tag,cls='',value='')=>node(tag,cls,value);
+  function setText(id,value){get(id).textContent=value;}
+  function careerIndex(id){return Math.max(0,S.graph.careers.findIndex(c=>c.id===id));}
+  function theme(id){const i=careerIndex(id);return {color:palette[i%palette.length],glyph:glyphs[i%glyphs.length]};}
+  function view(){return S.graph?StarGraph.decorate(S.graph,S.progress):null;}
+  function modeUI(){
+    document.querySelectorAll('.star-mode-switch button').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.star===S.mode)));
+    get('star-demo-actions').hidden=S.mode!=='demo';setText('star-mode-tag',S.mode==='demo'?'演示星图 · 不写入个人进度':'AI 个人星图');
+    setText('star-source',S.mode==='demo'?'九方向示例，个人星图由 AI 动态生成':'根据专业、岗位与能力差距动态生成');
+    get('tree-workspace').hidden=false;
+  }
+  function load(value){
+    platform.canvas?.cancel();S.full=false;S.expanded.clear();S.mode='live';S.graph=value.tree;S.progress=[...value.progress];S.focus=null;S.selected=null;platform.tree=value;
+    setText('tree-title',value.tree.title);setText('tree-state','完成节点考核后解锁后续技能，旧版自我记录不作为考核结果。');
+    get('tree-config').open=false;modeUI();draw(true);
+  }
+  function switchMode(mode){
+    platform.canvas?.cancel();if(mode==='demo'){
+      S.mode='demo';S.full=false;S.expanded.clear();S.graph=StarGraph.demo();S.progress=[];S.focus=null;S.selected=null;get('tree-config').open=false;modeUI();draw(true);
+    }else if(platform.tree)load(platform.tree);
+    else{S.mode='live';S.graph=null;S.progress=[];S.selected=null;S.focus=null;modeUI();drawEmpty();get('tree-config').open=true;}
+  }
+  function drawEmpty(){
+    get('star-stage-list').hidden=true;get('star-stage-list').replaceChildren();get('star-dependency-toggle').disabled=true;get('star-dependency-toggle').setAttribute('aria-pressed','false');get('star-dependency-toggle').textContent='完整依赖';
+    const scene=get('tree-scene'),space=get('tree-space');scene.replaceChildren();scene.style.cssText='';space.style.cssText='';
+    const empty=el('div','star-empty');empty.append(el('span','','✧'),el('h2','','你的成长星图，由你定义'),el('p','','输入目标岗位和已有基础，让 AI 连接你的技能与职业方向。也可以先探索九方向演示。'));
+    const b=el('button','','探索演示星图');b.type='button';b.addEventListener('click',()=>switchMode('demo'));empty.append(b);scene.append(empty);scene.style.height='620px';scene.style.width='100%';
+    setText('tree-title','等待点亮的成长宇宙');setText('tree-progress','0 / 0');setText('star-level','LV.01');setText('star-level-name','学习者成长起点');setText('star-career-count','—');get('star-progress-fill').style.transform='scaleX(0)';setText('tree-zoom','—');setText('star-focus-label','职业总览');setText('tree-summary','先定义目标，再连接每一步成长。');renderDetail();
+  }
+  function updateHUD(g){
+    const completed=g.nodes.filter(n=>n.status==='completed').length,total=g.nodes.length,level=1+Math.floor(completed/4);
+    setText('tree-title',g.title);setText('tree-progress',completed+' / '+total+' 项');setText('star-level','LV.'+String(level).padStart(2,'0'));
+    setText('star-level-name',completed===0?(g.learner_label||'学习者成长起点')+' · 探索者':completed<8?'基础积累 · 持续进阶':completed<18?'技能连接 · 实践成长':'项目进阶 · 职业探索');
+    setText('star-career-count',g.careers.length);get('star-progress-fill').style.transform='scaleX('+(total?completed/total:0)+')';
+    const c=g.careers.find(c=>c.id===S.focus);setText('star-focus-label',c?c.name+' · 技能路径':'职业总览');
+    const selected=g.nodes.some(n=>n.id===S.selected);
+    setText('tree-summary',!c?'总览收起共享技能连线，点击职业逐层探索。':S.full?'显示此职业的全部真实依赖。':selected?'仅显示当前技能的直接前置与后续关系。':'阶段主干为导航示意，展开后选择技能查看真实依赖。');
+    const toggle=get('star-dependency-toggle');toggle.disabled=!c;toggle.setAttribute('aria-pressed',String(S.full&&Boolean(c)));toggle.textContent=S.full&&c?'收起完整依赖':'完整依赖';
+    const stages=get('star-stage-list');stages.replaceChildren();stages.hidden=!c||S.full;
+    if(c)for(const group of S.display.groups){const b=el('button','',`${group.stage} · ${group.count}项 ${group.expanded?'收起':'展开'}`);b.type='button';b.dataset.starStage=String(group.index);b.setAttribute('aria-expanded',String(group.expanded));stages.append(b);}
+
+  }
+  function layoutKey(){return S.mode+':'+(S.mode==='live'?platform.tree?.id:'sample')+':'+(S.focus||'overview');}
+  function displayedIds(){return new Set(S.layout.points.keys());}
+  function fitZoom(){const vp=get('tree-scroll');return Math.max(.2,Math.min(.9,vp.clientWidth/1900*.98,vp.clientHeight/1700*.98));}
+  function draw(fit=false){
+    if(!S.graph){drawEmpty();return;}
+    platform.canvas?.cancel();const g=view();S.layout=StarGraph.layout(g,S.focus);
+    S.display=window.StarDisplay.plan(g,{focus:S.focus,selected:S.selected,full:S.full,expanded:[...S.expanded]});
+    for(const [id,p] of S.layout.points)if(p.kind==='skill'&&!S.display.skillIds.has(id))S.layout.points.delete(id);
+    S.display.groups.forEach(group=>{const angle=-Math.PI*.75+group.index*.85,radius=[240,350,470,580][group.index];S.layout.points.set(group.id,{kind:'group',x:S.layout.cx+Math.cos(angle)*radius,y:S.layout.cy+Math.sin(angle)*radius});});
+    if(fit)S.zoom=S.focus?Math.max(.4,fitZoom()):fitZoom();
+    S.layout=StarGraph.separate(S.layout,S.zoom,S.positions.get(layoutKey())||new Map(),displayedIds());
+    const scene=get('tree-scene');scene.replaceChildren();scene.style.width=S.layout.width+'px';scene.style.height=S.layout.height+'px';
+    const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('width',S.layout.width);svg.setAttribute('height',S.layout.height);svg.setAttribute('aria-hidden','true');scene.append(svg);
+    for(const [id,p] of S.layout.points){
+      const n=g.nodes.find(n=>n.id===id),c=g.careers.find(c=>c.id===id),group=S.display.groups.find(group=>group.id===id);
+      const kind=p.kind,b=el('button','star-node '+kind+(n?' '+n.status:c&&c.coverage===100?' completed':''));b.type='button';b.dataset.skillId=id;
+      b.style.left=(p.x-56)+'px';b.style.top=(p.y-52.5)+'px';b.style.width='112px';
+      const orb=el('span','star-orb',kind==='student'?'⌘':kind==='group'?'⋯':kind==='career'?theme(id).glyph:n.status==='completed'?'✓':n.status==='locked'?'⌑':StarGraph.stages.indexOf(n.stage)===3?'⬡':'✧');orb.setAttribute('aria-hidden','true');b.append(orb);
+      const label=kind==='student'?(g.learner_label||'学习者成长起点'):group?group.stage:n?n.name:c.name;b.append(el('span','star-node-label',label));
+      b.append(el('span','star-node-meta',kind==='student'?'成长起点':group?(group.expanded?'点击收起 '+group.count+' 项':group.hiddenCount?'还有 '+group.hiddenCount+' 项技能':'该阶段技能已显示'):c?'技能覆盖率 '+c.coverage+'%':n.shared_count>1?'共享于 '+n.shared_count+' 个方向':n.status==='locked'?'前置待完成':n.status==='completed'?'考核完成':'可以学习'));
+      if(group)b.setAttribute('aria-expanded',String(group.expanded));
+      b.setAttribute('aria-label',label+(group?'，'+group.count+'项技能，'+(group.expanded?'点击收起':'点击展开'):n?'，'+({locked:'未解锁',available:'可学习',completed:'已完成'}[n.status]):c?'，技能覆盖率'+c.coverage+'%':''));b.setAttribute('aria-pressed',String(S.selected===id));
+      if(c)b.style.setProperty('--career-color',theme(id).color);scene.append(b);
+    }
+    applyZoom(fit);updateHUD(g);highlight();renderDetail();
+  }
+  function applyZoom(center=false){
+    if(!S.graph)return;const scene=get('tree-scene'),space=get('tree-space');scene.style.width=S.layout.width+'px';scene.style.height=S.layout.height+'px';const svg=scene.querySelector('svg');if(svg){svg.setAttribute('width',S.layout.width);svg.setAttribute('height',S.layout.height);}scene.style.transform=`scale(${S.zoom})`;
+    const viewport=get('tree-scroll'),pad=80;space.style.width=Math.max(viewport.clientWidth,S.layout.width*S.zoom)+pad*2+'px';space.style.height=Math.max(viewport.clientHeight,S.layout.height*S.zoom)+pad*2+'px';space.style.marginLeft='0';space.style.marginTop='0';scene.style.left=pad+Math.max(0,(viewport.clientWidth-S.layout.width*S.zoom)/2)+'px';scene.style.top=pad+Math.max(0,(viewport.clientHeight-S.layout.height*S.zoom)/2)+'px';
+    const geometry=[...scene.querySelectorAll('.star-node')].map(b=>{const orb=b.querySelector('.star-orb');return {b,height:b.offsetHeight,delta:b.offsetHeight/2-orb.offsetTop-orb.offsetHeight/2,p:S.layout.points.get(b.dataset.skillId)};});
+    geometry.forEach(({b,height,delta,p})=>{b.dataset.anchor=String(delta);b.dataset.layoutHeight=String(height);b.style.left=(p.x-56)+'px';b.style.transform=`scale(${1/S.zoom})`;b.style.top=(p.y-height/2+delta/S.zoom)+'px';});setText('tree-zoom',Math.round(S.zoom*100)+'%');drawEdges();
+    if(center){const vp=get('tree-scroll');vp.scrollLeft=Math.max(0,scene.offsetLeft+S.layout.cx*S.zoom-vp.clientWidth/2);vp.scrollTop=Math.max(0,scene.offsetTop+S.layout.cy*S.zoom-vp.clientHeight/2);}
+  }
+  function pathFor(from,to,aggregate=false){
+    const a=S.layout.points.get(from),b=S.layout.points.get(to);if(!a||!b)return '';
+    const dx=b.x-a.x,dy=b.y-a.y,length=Math.hypot(dx,dy);if(length<1)return '';
+    const trim=Math.min(length*.22,28/S.zoom),sx=a.x+dx/length*trim,sy=a.y+dy/length*trim,ex=b.x-dx/length*trim,ey=b.y-dy/length*trim;
+    const bend=aggregate?length*.07:length*.035;
+    return `M${sx},${sy} Q${(sx+ex)/2-dy/length*bend},${(sy+ey)/2+dx/length*bend} ${ex},${ey}`;
+  }
+  function drawEdges(){
+    const svg=get('tree-scene').querySelector('svg');if(!svg)return;svg.replaceChildren();const g=view(),ns='http://www.w3.org/2000/svg',make=tag=>document.createElementNS(ns,tag);
+    const defs=make('defs'),marker=make('marker');marker.id='star-arrow';marker.setAttribute('viewBox','0 0 8 8');marker.setAttribute('refX','7');marker.setAttribute('refY','4');marker.setAttribute('markerWidth','6');marker.setAttribute('markerHeight','6');marker.setAttribute('orient','auto');const arrow=make('path');arrow.setAttribute('d','M1 1 L7 4 L1 7');arrow.setAttribute('fill','none');arrow.setAttribute('stroke','#6e83ac');marker.append(arrow);defs.append(marker);svg.append(defs);
+    const orbits=make('g');orbits.setAttribute('class','star-orbits');for(const radius of S.focus?[250,350,470,580,640]:[260,640]){const c=make('circle');c.setAttribute('cx',950);c.setAttribute('cy',850);c.setAttribute('r',radius);orbits.append(c);}svg.append(orbits);
+    let particles=0;const noMotion=matchMedia('(prefers-reduced-motion: reduce)').matches;
+    function link(from,to,state,aggregate=false){
+      const d=pathFor(from,to,aggregate);if(!d)return;
+      const p=make('path');p.dataset.from=from;p.dataset.to=to;p.dataset.aggregate=String(aggregate);p.setAttribute('d',d);p.setAttribute('class','path-'+(aggregate?'overview':state));p.setAttribute('vector-effect','non-scaling-stroke');p.setAttribute('marker-end','url(#star-arrow)');svg.append(p);
+      if(state==='completed'&&!aggregate&&!noMotion&&particles<2&&S.selected&&(from===S.selected||to===S.selected)){const dot=make('circle');dot.setAttribute('r',2/S.zoom);dot.setAttribute('class','star-energy');const motion=make('animateMotion');motion.setAttribute('path',d);motion.setAttribute('dur',(3+particles*.3)+'s');motion.setAttribute('repeatCount','3');dot.append(motion);svg.append(dot);particles++;}
+    }
+    S.display.edges.forEach(edge=>{
+      const n=g.nodes.find(n=>n.id===edge.to),c=g.careers.find(c=>c.id===edge.to);
+      const state=n?(n.status==='completed'?'completed':n.status==='available'?'ready':'locked'):c&&c.coverage===100?'completed':'locked';
+      link(edge.from,edge.to,state,edge.navigation);
+    });
+    highlight();
+  }
+  function highlight(){
+    document.querySelectorAll('#tree-scene .star-node').forEach(b=>{b.classList.toggle('selected',b.dataset.skillId===S.selected);b.setAttribute('aria-pressed',String(b.dataset.skillId===S.selected));});
+    document.querySelectorAll('#tree-scene path[data-from]').forEach(p=>p.classList.toggle('emphasized',Boolean(S.selected)&&(p.dataset.from===S.selected||p.dataset.to===S.selected)));
+  }
+  function select(id){
+    if(!S.graph)return;const group=S.display?.groups.find(g=>g.id===id);if(group){toggleStage(group.index);return;}const career=S.graph.careers.find(c=>c.id===id);
+    if(career&&S.focus!==id){S.full=false;S.expanded.clear();S.focus=id;S.selected=id;draw(true);[...get('tree-scene').querySelectorAll('[data-skill-id]')].find(b=>b.dataset.skillId===id)?.focus({preventScroll:true});return;}
+    if(id==='student'){overview();return;}
+    const panelFocus=get('star-detail-body').contains(document.activeElement);S.selected=id;draw();if(!panelFocus)[...get('tree-scene').querySelectorAll('[data-skill-id]')].find(b=>b.dataset.skillId===id)?.focus({preventScroll:true});if(panelFocus){get('star-detail-body').tabIndex=-1;get('star-detail-body').focus({preventScroll:true});}
+  }
+  function clear(){S.selected=null;draw();}
+  function overview(){S.full=false;S.expanded.clear();S.focus=null;S.selected=null;draw(true);}
+  function toggleStage(index){if(!S.focus)return;const canvasFocus=get('tree-scene').contains(document.activeElement);S.full=false;S.selected=null;S.expanded=new Set(window.StarDisplay.nextExpanded([...S.expanded],index,Boolean(S.display.groups.find(g=>g.index===index)?.expanded)));draw();const target=canvasFocus?[...get('tree-scene').querySelectorAll('[data-skill-id]')].find(b=>b.dataset.skillId==='@stage:'+index):[...get('star-stage-list').querySelectorAll('button')].find(b=>b.dataset.starStage===String(index));target?.focus({preventScroll:true});}
+  function dependencies(){if(!S.focus)return;S.full=!S.full;draw();}
+  function addHeading(root,label,values){root.append(el('h3','',label));const ul=el('ul');values.forEach(value=>ul.append(el('li','',value)));root.append(ul);}
+  function skillButtons(root,ids,g){const list=el('div','star-skill-list');ids.forEach(id=>{const n=g.nodes.find(n=>n.id===id);if(!n)return;const b=el('button','',`${n.status==='completed'?'✓':n.status==='available'?'✧':'○'} ${n.name}`);b.type='button';b.addEventListener('click',()=>select(id));list.append(b);});root.append(list);}
+  function renderDetail(){
+    const root=get('star-detail-body');if(!root)return;root.replaceChildren();const g=view();
+    if(!g){setText('star-panel-label','成长导航');root.append(el('div','star-detail-symbol','✦'),el('h2','','连接你的可能性'),el('p','','正式星图根据目标岗位、JD 和能力差距由 AI 动态生成。每一项共享技能，都会影响它连接的职业方向。'));addHeading(root,'成长方式',['先明确目标与基础','学习并完成实战任务','通过考核，点亮后续技能']);return;}
+    const n=g.nodes.find(n=>n.id===S.selected),c=g.careers.find(c=>c.id===S.selected);
+    if(n){
+      setText('star-panel-label','技能档案');root.append(el('div','star-detail-symbol',n.status==='completed'?'✓':'✧'),el('h2','',n.name));const chips=el('div','star-chip-row');chips.append(el('span','star-chip '+n.status,{locked:'未解锁',available:'可学习',completed:'已完成'}[n.status]),el('span','star-chip',n.stage));if(n.shared_count>1)chips.append(el('span','star-chip','共享 '+n.shared_count+' 个方向'));root.append(chips,el('p','',n.description));
+      root.append(el('h3','','前置要求'));if(n.prerequisites.length)skillButtons(root,n.prerequisites,g);else root.append(el('p','','无前置技能，可从这里开始。'));
+      addHeading(root,'学习资源',n.resources||['课程资料：待补充']);root.append(el('h3','','实战任务'),el('p','',n.task));
+      root.append(el('h3','','节点考核'),el('p','',S.mode==='demo'?'演示通过只改变当前示例进度，不生成真实考核成绩。':'至少 3 道不同题目，正确率达到 80% 且前置已完成，才点亮此技能。AI 题目仍需结合课程核对。'));
+      let consent;
+      if(S.mode==='live'){const label=el('label','check-line'),input=el('input');input.type='checkbox';input.id='star-node-consent';consent=input;label.append(input,document.createTextNode('同意发送此技能内容生成 AI 考核。'));root.append(label);}
+      const action=button(S.mode==='demo'?(n.status==='completed'?'已在演示中点亮':'演示通过考核'):(n.status==='completed'?'再做一次巩固练习':'开始节点考核'),async()=>{if(S.mode==='demo'){completeDemo(n.id);return;}if(!consent.checked)throw Error('请先同意生成本次考核。');await startExam(n.id);},'primary');action.disabled=n.status==='locked'||(S.mode==='demo'&&n.status==='completed');root.append(action);
+      root.append(el('p','star-subtle',n.status==='locked'?'完成前置技能后，本节点自动变为可学习。':'技能完成状态用于学习规划，不代表能力认证。'));
+    }else if(c){
+      setText('star-panel-label','目标职业');const symbol=el('div','star-detail-symbol',theme(c.id).glyph);symbol.style.color=theme(c.id).color;root.append(symbol,el('h2','',c.name),el('p','',c.description));
+      const rate=el('div','star-coverage-number');rate.append(el('strong','',c.coverage+'%'),el('span','','技能覆盖率'));root.append(rate);const track=el('div','star-progress-track'),fill=el('i');fill.style.transform='scaleX('+c.coverage/100+')';track.append(fill);root.append(track,el('p','star-subtle',`${c.completed_count} / ${c.required_count} 项必备技能已完成 · 非招聘录用概率`));
+      root.append(el('h3','','已掌握技能'));if(c.mastered.length)skillButtons(root,c.mastered,g);else root.append(el('p','','尚无考核完成记录。'));
+      root.append(el('h3','','缺失技能'));if(c.missing.length)skillButtons(root,c.missing,g);else root.append(el('p','','此路径必备技能已全部完成。'));
+      const next=c.missing.map(id=>g.nodes.find(n=>n.id===id)).filter(n=>n.status==='available');addHeading(root,'推荐下一步',next.length?next.slice(0,3).map(n=>'学习并考核：'+n.name):c.missing.length?['先完成上述前置技能。']:['整理项目成果，补充简历中的能力证据。']);addHeading(root,'建议项目',c.projects);root.append(el('p','star-subtle','覆盖率 = 已完成必备技能数 / 必备技能总数。包含前置技能；不衡量真实招聘结果。'));
+    }else{
+      setText('star-panel-label','职业导航');root.append(el('div','star-detail-symbol','✦'),el('h2','',S.focus?'继续连接你的技能':'每一条路径，都有交点'),el('p','',S.focus?'点击技能查看学习内容、前置要求与实战任务。':'从中央学生起点出发。基础能力被多个职业复用，点击职业展开依赖路径。'));
+      root.append(el('h3','',g.careers.length+' 个职业方向'));const list=el('div','star-career-list');g.careers.forEach(c=>{const b=el('button','star-career-item');b.type='button';b.style.setProperty('--career-color',theme(c.id).color);const text=el('div');text.append(el('strong','',c.name),el('small','',`${c.completed_count} / ${c.required_count} 必备技能`));b.append(el('span','',theme(c.id).glyph),text,el('em','',c.coverage+'%'));b.setAttribute('aria-label',c.name+'，技能覆盖率'+c.coverage+'%');b.addEventListener('click',()=>select(c.id));list.append(b);});root.append(list,el('p','star-subtle','百分比为技能覆盖率，不代表录用概率。'));
+    }
+  }
+  function unlockedBefore(){return new Set(view()?.careers.filter(c=>c.coverage===100).map(c=>c.id)||[]);}
+  function celebrate(before){const now=view()?.careers.filter(c=>c.coverage===100&&!before.has(c.id))||[];if(!now.length)return;S.pendingAchievements.push(...now.map(c=>c.name));if(state.view==='tree')showAchievement();}
+  function showAchievement(){if(!S.pendingAchievements.length)return;const box=get('star-achievement');box.replaceChildren(el('strong','','✧ 职业路径解锁'),el('p','',S.pendingAchievements.join(' · ')),el('p','','必备技能已完成。此成就不代表职业认证或录用。'));S.pendingAchievements=[];box.hidden=false;clearTimeout(S.achievementTimer);S.achievementTimer=setTimeout(()=>box.hidden=true,5200);}
+  function sample(){if(S.mode!=='demo')return;const before=unlockedBefore();S.progress=['cs','code','git','net','db','http','dir_frontend','skill_frontend'];S.selected='career_frontend';S.focus='career_frontend';draw(true);celebrate(before);toast('已加载演示进度，完成前端项目即可展示职业解锁。');}
+  function completeDemo(id){if(S.mode!=='demo')return;const n=view().nodes.find(n=>n.id===id);if(!n||n.status!=='available')return;const before=unlockedBefore();S.progress=[...new Set([...S.progress,id])];draw();celebrate(before);}
+  async function startExam(id){
+    if(S.mode!=='live'||!platform.tree)return;const n=view().nodes.find(n=>n.id===id);if(!n||n.status==='locked')throw Error('请先完成前置技能。');
+    const tid=platform.tree.id;toast('AI 正在生成节点考核…');const exam=await api('/learning/exams',{method:'POST',data:{tree_id:tid,node_ids:[id],unlock:n.status!=='completed',consent:true}});
+    if(S.mode==='live'&&platform.tree?.id===tid){renderExam(exam);show('exam');}
+  }
+  async function applyExam(result){
+    if(!result.tree_id||platform.tree?.id!==result.tree_id)return;const before=unlockedBefore(),focus=S.focus,selected=S.selected;
+    const data=await api('/learning/trees');const value=data.items.find(t=>t.id===result.tree_id);if(!value)return;
+    platform.tree=value;if(S.mode==='live'){S.graph=value.tree;S.progress=value.progress;S.focus=focus;S.selected=selected;draw();celebrate(before);}
+  }
+  function setZoom(next,anchor=null){
+    if(!S.graph||S.drag)return;
+    const vp=get('tree-scroll'),scene=get('tree-scene'),rect=vp.getBoundingClientRect(),old=S.zoom;
+    const sx=anchor?anchor.clientX-rect.left-vp.clientLeft:vp.clientWidth/2,sy=anchor?anchor.clientY-rect.top-vp.clientTop:vp.clientHeight/2;
+    const wx=(vp.scrollLeft+sx-scene.offsetLeft)/old,wy=(vp.scrollTop+sy-scene.offsetTop)/old;
+    S.zoom=Math.max(.2,Math.min(1.8,next));
+    applyZoom();
+    vp.scrollLeft=scene.offsetLeft+wx*S.zoom-sx;vp.scrollTop=scene.offsetTop+wy*S.zoom-sy;
+    clearTimeout(S.settleTimer);S.settleTimer=setTimeout(()=>{
+      if(!S.graph||S.drag)return;
+      S.layout=StarGraph.separate(S.layout,S.zoom,S.positions.get(layoutKey())||new Map(),displayedIds());applyZoom();
+    },150);
+  }
+  function zoom(delta){setZoom(S.zoom+delta);}
+  function wheelZoom(event){
+    if(!S.graph||S.drag)return;S.wheelDelta+=Math.max(-500,Math.min(500,event.deltaY));S.wheelAnchor=event;
+    if(S.wheelFrame)return;
+    S.wheelFrame=requestAnimationFrame(()=>{S.wheelFrame=0;const delta=S.wheelDelta;S.wheelDelta=0;setZoom(S.zoom*Math.exp(-delta*.0014),S.wheelAnchor);});
+  }
+  function updateDraggedNode(){
+    if(!S.drag)return;const d=S.drag,p=S.layout.points.get(d.id);
+    p.x=Math.max(85/S.zoom,Math.min(S.layout.width-90/S.zoom,d.x+d.dx/S.zoom));
+    p.y=Math.max(45/S.zoom,Math.min(S.layout.height-100/S.zoom,d.y+d.dy/S.zoom));
+    const b=[...get('tree-scene').querySelectorAll('[data-skill-id]')].find(b=>b.dataset.skillId===d.id);
+    if(b){b.style.left=(p.x-56)+'px';b.style.top=(p.y-Number(b.dataset.layoutHeight)/2+Number(b.dataset.anchor)/S.zoom)+'px';}
+    get('tree-scene').querySelectorAll('path[data-from]').forEach(path=>{if(path.dataset.from===d.id||path.dataset.to===d.id)path.setAttribute('d',pathFor(path.dataset.from,path.dataset.to,path.dataset.aggregate==='true'));});
+  }
+  function dragNode(id,dx,dy){
+    if(!S.graph||!S.layout.points.has(id))return;
+    if(!S.drag){const p=S.layout.points.get(id);S.drag={id,x:p.x,y:p.y,dx:0,dy:0};get('tree-scene').querySelectorAll('.star-energy').forEach(dot=>dot.remove());clearTimeout(S.settleTimer);}
+    S.drag.dx=dx;S.drag.dy=dy;
+    if(!S.dragFrame)S.dragFrame=requestAnimationFrame(()=>{S.dragFrame=0;updateDraggedNode();});
+  }
+  function endNodeDrag(id,cancelled=false){
+    if(!S.drag||S.drag.id!==id)return;cancelAnimationFrame(S.dragFrame);S.dragFrame=0;updateDraggedNode();const d=S.drag;S.drag=null;
+    if(cancelled){Object.assign(S.layout.points.get(id),{x:d.x,y:d.y});}
+    else{
+      const others=[...S.layout.points].filter(([other])=>other!==id&&displayedIds().has(other)).map(([,p])=>p);
+      const p=StarGraph.freePosition(S.layout.points.get(id),others,S.zoom);S.layout.points.set(id,p);
+      S.layout.width=Math.max(S.layout.width,p.x+90/S.zoom);S.layout.height=Math.max(S.layout.height,p.y+100/S.zoom);
+      const saved=S.positions.get(layoutKey())||new Map();saved.set(id,{x:p.x,y:p.y});S.positions.set(layoutKey(),saved);
+    }
+    applyZoom();
+  }
+  function arrange(){if(!S.graph)return;S.positions.delete(layoutKey());draw(true);}
+  function reset(){if(S.mode!=='demo')return;[...S.positions.keys()].filter(k=>k.startsWith('demo:')).forEach(k=>S.positions.delete(k));S.full=false;S.expanded.clear();S.progress=[];S.focus=null;S.selected=null;S.pendingAchievements=[];get('star-achievement').hidden=true;draw(true);toast('演示已重置，个人学习记录未修改。');}
+  function init(){
+    if(S.initialized)return;S.initialized=true;modeUI();drawEmpty();
+    document.querySelector('#view-tree').addEventListener('pointerdown',()=>document.body.classList.remove('star-keyboard'));
+    document.querySelector('#view-tree').addEventListener('keydown',()=>document.body.classList.add('star-keyboard'));
+    document.querySelector('#view-tree').addEventListener('click',event=>{const b=event.target.closest('[data-star]');if(!b){const stage=event.target.closest('[data-star-stage]');if(stage)toggleStage(Number(stage.dataset.starStage));return;}const actions={live:()=>switchMode('live'),demo:()=>switchMode('demo'),overview,clear,sample,reset,arrange,dependencies,center:()=>draw(true),'zoom-in':()=>zoom(.1),'zoom-out':()=>zoom(-.1)};actions[b.dataset.star]?.();});
+    get('tree-scroll').addEventListener('keydown',event=>{
+      if(event.key==='Home'){event.preventDefault();draw(true);get('tree-scroll').focus({preventScroll:true});return;}if(event.key==='+'||event.key==='='){event.preventDefault();zoom(.1);return;}if(event.key==='-'){event.preventDefault();zoom(-.1);return;}
+      const current=event.target.closest('[data-skill-id]');if(current&&event.altKey&&['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)){event.preventDefault();const dx=event.key==='ArrowLeft'?-32:event.key==='ArrowRight'?32:0,dy=event.key==='ArrowUp'?-32:event.key==='ArrowDown'?32:0;dragNode(current.dataset.skillId,dx,dy);endNodeDrag(current.dataset.skillId);return;}if(!current||!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)||!S.layout)return;
+      const pos=S.layout.points.get(current.dataset.skillId);const candidates=[...get('tree-scene').querySelectorAll('[data-skill-id]')].filter(b=>b!==current).map(b=>({b,p:S.layout.points.get(b.dataset.skillId)})).filter(({p})=>event.key==='ArrowLeft'?p.x<pos.x-1:event.key==='ArrowRight'?p.x>pos.x+1:event.key==='ArrowUp'?p.y<pos.y-1:p.y>pos.y+1).sort((a,b)=>Math.hypot(a.p.x-pos.x,a.p.y-pos.y)-Math.hypot(b.p.x-pos.x,b.p.y-pos.y));
+      if(candidates.length){event.preventDefault();candidates[0].b.focus();}
+    });
+    let resizeFrame=0;window.addEventListener('resize',()=>{cancelAnimationFrame(resizeFrame);resizeFrame=requestAnimationFrame(()=>{if(state.view==='tree'&&S.graph)draw(true);});});
+    window.addEventListener('viewchange',event=>{document.body.classList.toggle('star-theme',event.detail==='tree');if(event.detail==='tree')showAchievement();else get('star-achievement').hidden=true;});
+  }
+  function clearAll(){platform.canvas?.cancel();cancelAnimationFrame(S.wheelFrame);cancelAnimationFrame(S.dragFrame);clearTimeout(S.settleTimer);S.wheelFrame=0;S.dragFrame=0;S.drag=null;S.positions.clear();S.full=false;S.expanded.clear();S.graph=null;S.progress=[];S.focus=null;S.selected=null;S.mode='live';S.pendingAchievements=[];if(S.initialized){modeUI();drawEmpty();}}
+  return {init,load,select,clear,overview,draw,renderDetail,applyExam,clearAll,dragNode,endNodeDrag,wheelZoom,get mode(){return S.mode;}};
+})();
+```
+
+### `static/starmap.css`
+
+```css
+/* 独立星图主题：静态材质、低强度辉光；仅交互反馈使用短动画。 */
+body.star-theme{background:#080e1d;color:#dce6fa}body.star-theme .shell{background:#080e1d}body.star-theme .sidebar{background:#0b1223;border-right:1px solid #202a40}body.star-theme .brand,body.star-theme .brand-mark{color:#b9c6ff}body.star-theme .nav-item{color:#8694af}body.star-theme .nav-item.active{background:#252d4e;color:#dbe3ff;box-shadow:inset 2px 0 #8895f4}body.star-theme .topbar{background:#0c1424;border-color:#202a3e}body.star-theme .breadcrumb,body.star-theme .breadcrumb strong{color:#a1aec6}body.star-theme .top-actions .button{background:#182338;color:#c4cfea;border-color:#2a3650}body.star-theme main{max-width:1800px;padding:28px 30px 0}body.star-theme .page-footer{color:#77849d}body.star-theme .icon-button{border-color:#33405b;color:#a0aecb}
+#view-tree{--star-blue:#859bff;--star-cyan:#77d4d0;--star-purple:#b4a0ef;--star-ink:#dce6fa;--star-muted:#8f9db7;--star-line:#26314a;color:var(--star-ink)}
+.star-heading{display:flex;justify-content:space-between;align-items:center;gap:25px;margin-bottom:22px}.star-kicker{font-size:11px;letter-spacing:2px;color:#8697bf;margin-bottom:9px}.star-heading h1{font-size:30px;letter-spacing:-.6px;font-weight:650}.star-heading h1>span{font-size:20px;color:#8499ef;margin-left:14px}.star-heading>div>p:last-child{font-size:11px;color:#8291ad;line-height:1.8;margin-top:10px}.star-mode-switch{display:flex;padding:4px;background:#0e182b;border:1px solid #29344e;border-radius:10px;flex-shrink:0}.star-mode-switch button{font-size:11px;padding:9px 15px;color:#8c9cb8;border-radius:7px}.star-mode-switch button[aria-pressed=true]{background:#283456;color:#e1e9ff;box-shadow:0 2px 9px #0002}
+.star-config{border:1px solid #26324a;border-radius:11px;background:#101a2c;margin-bottom:18px}.star-config summary{display:flex;justify-content:space-between;gap:10px;padding:14px 18px;cursor:pointer;font-size:12px;color:#bdcbed;list-style:none}.star-config summary span{color:#7f8eaa;font-size:10px}.star-config-body{padding:4px 20px 20px}.star-config .field label{color:#a8b7d1}.star-config input:not([type=checkbox]),.star-config textarea,.star-config select{background:#0c1526;border-color:#303c56;color:#d9e5fa}.star-config input::placeholder,.star-config textarea::placeholder{color:#667896}.star-config .check-line{color:#8f9eb9;font-size:11px}.star-config .fine-print{color:#8798b5}.star-config input[type=checkbox]{accent-color:#8b9cf7}
+#view-tree .button.primary{background:#7789e2;color:#0b1228;border:1px solid #96a8ff}#view-tree .button.secondary{background:#17233b;border:1px solid #303e5c;color:#beccec}#view-tree .button:focus-visible,#view-tree button:focus-visible{outline:2px solid #a7bbff;outline-offset:4px}#view-tree .button:disabled{opacity:.45;cursor:not-allowed}
+.star-hud{display:flex;align-items:center;gap:25px;padding:20px 24px;margin-bottom:16px;border:1px solid #29354e;border-radius:13px;background:#121c2ee8;box-shadow:0 8px 28px #03081425}.star-level{display:flex;align-items:center;gap:16px;flex:1;min-width:0}.star-level>span{display:grid;place-items:center;flex:none;width:57px;height:57px;border:1px solid #697bc0;background:#1a2845;border-radius:13px;color:#b5c5ff;font-size:15px;font-weight:650}.star-level strong{display:block;font-size:14px;line-height:1.6;overflow-wrap:anywhere}.star-level p{font-size:10px;color:#899bbd;margin-top:5px}.star-hud-progress{width:190px}.star-hud-progress>div:first-child{display:flex;justify-content:space-between;font-size:10px;color:#8798b7;margin-bottom:9px}.star-hud-progress strong{font-size:12px;color:#c8d5ee}.star-progress-track{height:4px;background:#28324c;border-radius:4px;overflow:hidden}.star-progress-track i{display:block;height:100%;background:#8b9eee;transform-origin:left;transform:scaleX(0);transition:transform 200ms var(--ease)}.star-hud-count{padding-left:24px;border-left:1px solid #2c3850;text-align:center}.star-hud-count strong{display:block;font-size:23px;color:#aab9ff;font-weight:500}.star-hud-count span{display:block;font-size:9px;color:#8695b3;margin-top:3px}.star-mode-tag{font-size:9px;color:#8fb6d4;padding:5px 8px;border:1px solid #304761;border-radius:4px;white-space:nowrap}
+.star-main{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:16px;align-items:start}.star-map-shell{position:relative;min-width:0;overflow:hidden;border:1px solid #28334d;border-radius:15px;background:#0c1425;isolation:isolate}.star-map-top{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:16px 20px;border-bottom:1px solid #212e45;background:#111c2ec9;position:relative;z-index:2}.star-map-top strong{font-size:13px;display:block;font-weight:550}.star-map-top span{font-size:9px;color:#7f91b0;display:block;margin-top:5px;max-width:470px;line-height:1.6}.star-text-button{font-size:10px;color:#98abe6;white-space:nowrap}.star-viewport.tree-scroll{height:620px;min-height:620px;max-height:620px;border:0;border-radius:0;background-color:#0c1425;background-image:radial-gradient(ellipse at 50% 45%,#16213b50,transparent 68%),radial-gradient(circle,#a3b6ee66 .7px,transparent 1px),radial-gradient(circle,#a5baec30 .7px,transparent 1px),linear-gradient(#8ca4d508 1px,transparent 1px),linear-gradient(90deg,#8ca4d508 1px,transparent 1px);background-size:auto,173px 157px,113px 127px,44px 44px,44px 44px;background-position:center,17px 23px,78px 69px,center,center;scrollbar-width:thin;scrollbar-color:#334466 transparent;overscroll-behavior:contain}.star-viewport #tree-space{overflow:hidden}.star-viewport #tree-scene{position:relative}.star-viewport #tree-scene svg{overflow:visible}.star-orbits circle{fill:none;stroke:#8d9fcd0d;stroke-width:1}.star-orbits circle:last-child{stroke-dasharray:2 10}.star-viewport #tree-scene path{fill:none;stroke:#35435f;stroke-width:1.4;transition:opacity 160ms ease,stroke 160ms ease}.star-viewport #tree-scene path.path-completed{stroke:#7e9ec8;opacity:.72}.star-viewport #tree-scene path.path-ready{stroke:#6178a8;opacity:.65}.star-viewport #tree-scene path.path-locked{opacity:.3}.star-viewport #tree-scene path.path-overview{stroke-dasharray:4 9;stroke:#667ca8;opacity:.48}.star-viewport #tree-scene path.emphasized{stroke:#a1b6ff;opacity:.95;stroke-width:2}.star-energy{fill:#bfddff;opacity:.85;pointer-events:none}
+.star-node{position:absolute;width:112px;height:105px;display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:8px;color:#9daecf;text-align:center;transform-origin:50% 50%;padding:4px;touch-action:pinch-zoom;-webkit-tap-highlight-color:transparent;outline:0}.star-orb{position:relative;display:grid;place-items:center;flex:none;width:48px;height:48px;border:1px solid #3d4a68;background:#142039;color:#5c6c8e;border-radius:16px;clip-path:polygon(25% 0,75% 0,100% 25%,100% 75%,75% 100%,25% 100%,0 75%,0 25%);transition:transform 150ms var(--ease),background-color 150ms ease,color 150ms ease;font-size:20px}.star-orb::after{content:'';position:absolute;inset:3px;border:1px solid #8ca4ed18;border-radius:12px;pointer-events:none}.star-node-label{font-size:11px;line-height:1.5;font-weight:550;max-width:108px;overflow-wrap:anywhere;color:inherit}.star-node-meta{font-size:8px;color:#6f85a7;line-height:1.3;margin-top:-4px}.star-node.locked{color:#8190ad}.star-node.locked .star-orb{background:#111c2f;border-color:#303d57;color:#526580}.star-node.available{color:#b4c8f8}.star-node.available .star-orb{border-color:#7392cc;color:#a8c5ff;background:#1b2d4a}.star-node.completed{color:#c0e8e2}.star-node.completed .star-orb{border-color:#77b8b3;background:#1b353e;color:#a2e1d0;box-shadow:inset 0 0 12px #70c6ba12}.star-node.selected .star-orb{background:#31416a;outline:2px solid #adc3ff;color:#e6efff;box-shadow:0 0 16px #a6b7ff1c}.star-node.selected .star-node-label{color:#e0eaff}.star-node:active .star-orb{transform:scale(.95)}.star-node:focus-visible .star-orb{outline:2px solid #d3deff;outline-offset:4px;clip-path:none}.star-node.career .star-orb{border-radius:50%;clip-path:none;width:52px;height:52px;color:var(--career-color,#a3b7ff);border-color:var(--career-color,#a3b7ff);background:#18243a}.star-node.career .star-orb::after{border-radius:50%}.star-node.career .star-node-label{color:#b9c9e7;font-size:12px}.star-node.career .star-node-meta{color:var(--career-color)}.star-node.student{width:146px;height:128px;color:#dce5ff;gap:10px}.star-node.student .star-orb{clip-path:none;width:76px;height:76px;border-radius:50%;border-color:#7b8fc7;background:#1b2944;color:#c7d6ff;font-size:29px;box-shadow:0 0 0 7px #607dab0a}.star-node.student .star-orb::after{border-radius:50%;inset:7px;border-color:#c4d3ff18}.star-node.student .star-node-label{font-size:12px;max-width:146px}.star-node.student .star-node-meta{color:#7e93b8}.star-viewport.dragging .star-orb{transform:none}
+.star-map-bottom{display:flex;align-items:center;justify-content:space-between;gap:12px;position:relative;z-index:2;padding:12px 18px;background:#111a2bd9;border-top:1px solid #243149}.star-legend{display:flex;gap:14px;font-size:9px;color:#8596b3}.star-legend>span{display:flex;align-items:center;gap:5px}.star-legend i{height:5px;width:5px;border-radius:50%;background:#43506b}.star-legend i.available{background:#7a9cda}.star-legend i.completed{background:#85c4b4}.star-zoom{display:flex;align-items:center;gap:9px;font-size:10px;color:#98aaca}.star-zoom button{padding:5px 8px;border-radius:4px;border:1px solid #2e3b57;color:#b9c9e8;min-height:27px;font-size:11px;background:#16213a}.star-zoom span{min-width:32px;text-align:center}.star-gesture-hint{text-align:center;font-size:9px;letter-spacing:1px;color:#657995;padding:10px;background:#0d1728}.star-panel{position:sticky;top:18px;border:1px solid #2a3650;border-radius:14px;background:#121d30e8;backdrop-filter:blur(10px);min-width:0;overflow:hidden;box-shadow:0 12px 30px #00000012}.star-panel-top{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #29354e;padding:15px 19px;font-size:10px;color:#93a9ca;letter-spacing:1px}.star-panel-top button{font-size:19px;color:#7188aa;padding:0 5px}#star-detail-body{padding:23px 21px;max-height:720px;overflow:auto;scrollbar-width:thin;scrollbar-color:#344463 transparent}.star-detail-symbol{height:49px;width:49px;display:grid;place-items:center;border:1px solid #566ca0;border-radius:13px;background:#223151;color:#a9c1ff;font-size:23px;margin-bottom:18px}.star-panel h2{font-size:22px;line-height:1.45;letter-spacing:-.4px;margin-bottom:10px;color:#e1eaff}.star-panel p{font-size:11px;color:#90a3c2;line-height:1.9;overflow-wrap:anywhere}.star-panel h3{font-size:11px;color:#bdcdec;margin:23px 0 10px;font-weight:550}.star-panel ul{padding-left:16px;color:#8ea2c5;font-size:11px;line-height:1.9}.star-panel .button{margin-top:18px;width:100%;font-size:11px}.star-chip-row{display:flex;gap:6px;flex-wrap:wrap;margin:13px 0}.star-chip{padding:4px 8px;color:#9eb4d8;font-size:9px;border:1px solid #304360;border-radius:4px;background:#17273e}.star-chip.completed{color:#9bd3c2;border-color:#385a58}.star-chip.available{color:#b3c9ff;border-color:#4c6395}.star-panel .star-subtle{font-size:9px;color:#6c85a8;margin-top:12px}.star-skill-list{display:grid;gap:7px}.star-skill-list button{text-align:left;color:#98accd;font-size:10px;padding:8px 10px;background:#15253b;border:1px solid #2a3a55;border-radius:6px;line-height:1.5}.star-skill-list button:hover{border-color:#6c82ba;color:#d1e0ff}.star-career-list{display:grid;gap:8px}.star-career-item{display:flex;align-items:center;gap:10px;text-align:left;padding:11px;border:1px solid #293b59;background:#142138;border-radius:8px}.star-career-item>span{display:grid;place-items:center;width:30px;height:30px;border-radius:8px;background:#1c2d47;font-size:17px;color:var(--career-color)}.star-career-item>div{flex:1;min-width:0}.star-career-item strong{display:block;font-size:11px;font-weight:500;color:#bdd0ed}.star-career-item small{font-size:9px;color:#718bad;display:block;margin-top:4px}.star-career-item>em{font-size:11px;color:var(--career-color);font-style:normal}.star-coverage-number{display:flex;align-items:baseline;gap:5px;margin:19px 0 9px}.star-coverage-number strong{font-size:38px;font-weight:500;letter-spacing:-1px;color:#bbcdf9}.star-coverage-number span{font-size:11px;color:#8299bf}.star-panel .star-progress-track{height:5px}.star-demo-bar{display:flex;align-items:center;justify-content:space-between;gap:18px;background:#141e32;border:1px solid #36405d;border-radius:11px;margin-top:16px;padding:16px 21px}.star-demo-bar strong{display:block;color:#b5b5e9;font-size:12px}.star-demo-bar span{display:block;color:#778cac;font-size:10px;margin-top:5px}.star-demo-bar .button{font-size:10px;padding:8px 12px;min-height:34px}.star-achievement{position:absolute;top:90px;left:50%;transform:translateX(-50%);width:min(340px,85%);z-index:5;padding:19px 22px;border:1px solid #8797c6;border-radius:12px;background:#1b2943f5;box-shadow:0 14px 50px #0004;animation:star-achieve 240ms var(--ease) both;text-align:center;pointer-events:none}.star-achievement strong{color:#d8e4ff;font-size:15px;display:block;margin-bottom:7px}.star-achievement p{font-size:10px;color:#92afd0;line-height:1.8}.star-empty{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;color:#879cbe;width:270px}.star-empty>span{display:block;font-size:55px;color:#859dd5;margin-bottom:22px}.star-empty h2{font-size:18px;color:#bdcceb}.star-empty p{font-size:11px;line-height:1.9;margin-top:12px}.star-empty button{margin-top:20px;border:1px solid #4d6497;background:#223151;color:#c3d4f5;border-radius:7px;padding:10px 17px;font-size:11px}
+@keyframes star-achieve{from{opacity:0;transform:translate(-50%,6px) scale(.97)}to{opacity:1;transform:translate(-50%,0) scale(1)}}
+@media(hover:hover) and (pointer:fine){.star-node:hover .star-orb{transform:scale(1.05);background:#2a395d}.star-node:active .star-orb{transform:scale(.95)}.star-viewport.dragging .star-orb{transform:none}.star-career-item:hover{border-color:#536a9c}.star-zoom button:hover{background:#263757}}
+@media(max-width:1200px){.star-main{grid-template-columns:minmax(0,1fr) 280px}.star-hud{gap:18px}.star-hud-progress{width:140px}.star-hud-count{padding-left:16px}.star-level strong{font-size:12px}.star-mode-tag{display:none}.star-heading h1{font-size:27px}}
+@media(max-width:1000px){.star-main{grid-template-columns:minmax(0,1fr)}.star-panel{position:static}.star-career-list{grid-template-columns:repeat(3,minmax(0,1fr))}#star-detail-body{max-height:none}.star-viewport.tree-scroll{height:550px;min-height:550px;max-height:550px}.star-heading{align-items:flex-start}.star-mode-switch button{padding:8px 11px}}
+@media(max-width:700px){body.star-theme main{padding:22px 16px 0}.star-heading{flex-direction:column;gap:17px}.star-heading h1{font-size:26px}.star-heading>div>p:last-child{font-size:9px}.star-config summary{padding:13px 15px;font-size:11px}.star-config summary span{display:none}.star-hud{padding:15px;gap:12px;flex-wrap:wrap}.star-level{flex-basis:calc(100% - 65px)}.star-level>span{width:46px;height:46px;font-size:12px}.star-level strong{font-size:12px}.star-hud-progress{width:auto;flex:1;order:3}.star-hud-count{padding-left:12px}.star-hud-count strong{font-size:20px}.star-map-top{padding:14px;gap:10px}.star-map-top span{font-size:8px;max-width:200px}.star-text-button{font-size:9px}.star-viewport.tree-scroll{height:460px;min-height:460px;max-height:460px}.star-map-bottom{padding:11px 12px;gap:10px;flex-wrap:wrap}.star-legend{gap:12px;font-size:8px}.star-zoom{margin-left:auto;font-size:9px;gap:6px}.star-zoom button{font-size:10px;padding:4px 6px}.star-gesture-hint{font-size:8px}.star-career-list{grid-template-columns:repeat(2,minmax(0,1fr))}.star-career-item{padding:10px 8px;gap:7px}.star-career-item>span{width:25px;height:25px;font-size:14px}.star-career-item strong{font-size:10px}.star-demo-bar{align-items:flex-start;flex-direction:column;padding:15px}.star-demo-bar .button-row{gap:7px}.star-demo-bar .button{font-size:9px;padding:7px 9px}.star-node{width:96px}.star-node-label{font-size:10px;max-width:94px}.star-node.career .star-node-label{font-size:10px}.star-orb{width:39px;height:39px;font-size:17px;border-radius:12px}.star-node.career .star-orb{width:43px;height:43px}.star-node.student .star-orb{width:58px;height:58px;font-size:23px}.star-node.student{width:120px}.star-node.student .star-node-label{font-size:11px}.star-node-meta{font-size:8px}}
+@media(prefers-reduced-motion:reduce){.star-orb,.star-progress-track i,.star-viewport #tree-scene path{transition:none}.star-node:hover .star-orb,.star-node:active .star-orb{transform:none}.star-energy{display:none}.star-achievement{animation:none}}
+
+.star-keyboard .star-orb,.star-keyboard .star-progress-track i,.star-keyboard .star-viewport #tree-scene path{transition:none}.star-keyboard .star-node:active .star-orb{transform:none}.star-keyboard .star-achievement{animation:none}
+
+.star-node{cursor:grab;height:118px}.star-node-label{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.star-viewport.dragging-node,.star-viewport.dragging-node .star-node{cursor:grabbing}.star-viewport.dragging-node .star-orb{transform:none}
+
+.star-viewport{position:relative}
+
+/* 简洁模式：分组是导航入口，使用虚线外框，与真实技能节点区分。 */
+.star-display-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:flex-end}.star-dependency-toggle{border:1px solid #41557f;border-radius:6px;padding:7px 10px;color:#b2c7eb;background:#182740;font-size:10px}.star-dependency-toggle[aria-pressed=true]{background:#304267;border-color:#8ca5e1;color:#edf2ff}.star-dependency-toggle:disabled{opacity:.4;cursor:not-allowed}.star-stage-list{display:flex;flex-wrap:wrap;gap:7px;padding:12px 16px;border-bottom:1px solid #26354f;background:#101c2f}.star-stage-list button{padding:6px 9px;border:1px solid #344867;border-radius:6px;background:#17263e;color:#9db5db;font-size:9px}.star-stage-list button[aria-expanded=true]{border-color:#7896ce;background:#24385b;color:#d6e5ff}.star-node.group .star-orb{clip-path:none;border:1px dashed #8b9ad0;background:#24314e;border-radius:14px;color:#b9c6f0;font-size:25px}.star-node.group .star-node-label{color:#b8c8e8}.star-node.group .star-node-meta{color:#879fca}.star-node.group[aria-expanded=true] .star-orb{background:#304366;border-style:solid}.star-node.group:hover .star-orb{border-color:#c0d1f5}
+@media(max-width:700px){.star-display-actions{gap:8px}.star-dependency-toggle{font-size:9px;padding:6px 7px}.star-stage-list{padding:10px;gap:6px}.star-stage-list button{font-size:8px;padding:6px}}
 ```
 
 ### `static/platform.css`
@@ -3290,7 +3718,7 @@ input:not([type=checkbox]):not([type=radio]){width:100%;box-sizing:border-box;bo
   <meta name="color-scheme" content="light"><meta name="theme-color" content="#142f29">
   <title>职安 · AI 求职安全体检平台</title>
   <link rel="icon" href="/static/mark.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/styles.css"><link rel="stylesheet" href="/static/platform.css"><link rel="stylesheet" href="/static/camera.css"><script src="/static/app.js" defer></script><script src="/static/tree-canvas.js" defer></script><script src="/static/platform.js" defer></script><script src="/static/camera.js" defer></script>
+  <link rel="stylesheet" href="/static/styles.css"><link rel="stylesheet" href="/static/platform.css"><link rel="stylesheet" href="/static/camera.css"><script src="/static/app.js" defer></script><link rel="stylesheet" href="/static/starmap.css"><script src="/static/star-graph.js" defer></script><script src="/static/star-display.js" defer></script><script src="/static/starmap.js" defer></script><script src="/static/tree-canvas.js" defer></script><script src="/static/platform.js" defer></script><script src="/static/camera.js" defer></script>
 </head>
 <body>
 <svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
@@ -3699,6 +4127,129 @@ window.CameraAssist=(()=>{
 
 ## ④ 测试用例与匿名样例
 
+### `tests/test_camera.mjs`
+
+```text
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import fs from 'node:fs';
+const source=fs.readFileSync(new URL('../static/camera.js',import.meta.url),'utf8');
+function setup(){
+  const elements=new Map(),calls=[],notices=[];let acquired=0,stopped=0;
+  const stream={getTracks:()=>[{stop(){stopped++;}}],getVideoTracks:()=>[{addEventListener(){}}]};
+  const get=id=>{
+    if(id==='view-interview')return null;
+    if(!elements.has(id))elements.set(id,{value:'standard',checked:true,hidden:false,disabled:false,textContent:'',className:'',style:{},dataset:{},classList:{add(){},remove(){}},
+      setAttribute(){},append(){},replaceChildren(){},pause(){},async play(){},videoWidth:640,videoHeight:480,readyState:2,srcObject:null,getContext:()=>({clearRect(){}})});
+    return elements.get(id);
+  };
+  const context={window:{addEventListener(){}},document:{getElementById:get,createElement:()=>({getContext:()=>({drawImage(){}}),toBlob:fn=>fn({size:123})})},
+    navigator:{mediaDevices:{getUserMedia:async()=>{acquired++;return stream;}}},node:()=>({}),signed(){},toast:message=>notices.push(message),
+    state:{view:'interview'},performance,AbortController,clearTimeout,setTimeout:()=>1,
+    api:async(path)=>{calls.push(path);if(path.endsWith('/frame'))return new Promise(()=>{});return {id:'local-monitor',token:'test-token'};}};
+  vm.createContext(context);vm.runInContext(source,context);
+  return {context,cam:context.window.CameraAssist,get,stream,calls,notices,counts:()=>({acquired,stopped})};
+}
+test('未同意摄像头处理时不请求设备',async()=>{
+  const s=setup();s.get('camera-consent').checked=false;await s.cam.start();assert.equal(s.counts().acquired,0);assert.equal(s.calls.length,0);
+});
+test('权限请求尚未完成时关闭，随后得到的媒体轨道仍会释放',async()=>{
+  const s=setup();let resolve;
+  s.context.navigator.mediaDevices.getUserMedia=()=>new Promise(r=>resolve=r);
+  const starting=s.cam.start();await new Promise(setImmediate);assert.ok(resolve);
+  s.cam.stop();resolve(s.stream);await starting;
+  assert.ok(s.counts().stopped>=1);assert.equal(s.cam.active,false);assert.equal(s.get('camera-preview').srcObject,null);
+});
+test('模型未就绪不打开摄像头',async()=>{
+  const s=setup();s.context.api=async()=>{throw Error('本机视觉模型未配置完整。');};await s.cam.start();
+  assert.equal(s.counts().acquired,0);assert.match(s.get('camera-status').textContent,/模型/);assert.equal(s.get('camera-start').disabled,false);
+});
+test('关闭正在分析的摄像头会立即停止轨道并清空预览',async()=>{
+  const s=setup();await s.cam.start();assert.equal(s.cam.active,true);assert.equal(s.get('camera-mini').hidden,false);s.cam.stop();
+  assert.equal(s.cam.active,false);assert.equal(s.get('camera-preview').srcObject,null);assert.ok(s.counts().stopped>=1);
+  assert.equal(s.get('camera-mini').hidden,true);
+});
+
+test('持续动作提醒会显示在面试页面提示层',async()=>{
+  const s=setup(),request=s.context.api;
+  s.context.api=path=>path.endsWith('/frame')?Promise.resolve({status:'adjust',alerts:['hand_motion'],hints:['可尝试减少重复动作。'],face_count:1,face_box:null,hands:[],angles:{yaw:0,pitch:0,roll:0},calibrated:false}):request(path);
+  await s.cam.start();await new Promise(setImmediate);
+  assert.equal(s.notices.length,1);assert.match(s.notices[0],/画面提醒/);assert.equal(s.get('camera-mini').dataset.state,'warn');s.cam.stop();
+});
+```
+
+### `tests/test_voice.mjs`
+
+```text
+// 使用语音API替身检验实际前端状态机，不声称验证实体麦克风或浏览器云端ASR。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import fs from 'node:fs';
+const source=fs.readFileSync(new URL('../static/platform.js',import.meta.url),'utf8').replace('initPlatform().catch(e=>toast(e.message,true));','');
+function setup(){
+  const elements=new Map(),timers=[],cleared=[];
+  function $(id){if(!elements.has(id))elements.set(id,{checked:false,value:'',textContent:'',classList:{add(){},remove(){}}});return elements.get(id);}
+  class Recognition{start(){} abort(){this.aborted=true;} stop(){this.stopped=true;}}
+  const context={console,titles:{},state:{view:'interview'},window:{SpeechRecognition:Recognition,speechSynthesis:{cancel(){}}},
+    $,text:(id,value)=>{$(id).textContent=value;},
+    setTimeout:(fn,ms)=>{const id=timers.length;timers.push({fn,ms});return id;},clearTimeout:id=>cleared.push(id),
+    document:{},SpeechSynthesisUtterance:class{},api:async()=>({}),toast(){},show(){}};
+  vm.createContext(context);vm.runInContext(source,context);
+  vm.runInContext('platform.user={id:1}; platform.interview={id:1};',context);
+  return {context,$,timers,cleared,read:code=>vm.runInContext(code,context)};
+}
+test('持续识别不会延长三分钟硬截止',()=>{
+  const s=setup();s.$('#voice-consent').checked=true;s.$('#voice-auto').checked=true;
+  s.context.listen();const rec=s.read('platform.recognition');
+  assert.equal(s.timers.filter(t=>t.ms===180000).length,1);
+  rec.onresult({resultIndex:0,results:[Object.assign([{transcript:'合成回答'}],{isFinal:true})]});
+  rec.onresult({resultIndex:0,results:[Object.assign([{transcript:'继续回答'}],{isFinal:true})]});
+  assert.equal(s.timers.filter(t=>t.ms===180000).length,1);
+  s.timers.find(t=>t.ms===180000).fn();assert.equal(rec.stopped,true);
+});
+test('停止语音时撤销识别并释放两类计时器',()=>{
+  const s=setup();s.$('#voice-consent').checked=true;s.context.listen();
+  const rec=s.read('platform.recognition');s.context.stopVoice();
+  assert.equal(rec.aborted,true);assert.equal(s.read('platform.recognition'),null);assert.equal(s.read('platform.listening'),false);
+  assert.ok(s.cleared.includes(0));
+});
+test('离开面试页面后迟到追问不会渲染或朗读',async()=>{
+  const s=setup();s.$('#interview-consent').checked=true;s.$('#interview-answer').value='合成回答';
+  let finish;const pending=new Promise(resolve=>finish=resolve);s.context.api=()=>pending;
+  let spoken=0;s.context.speakQuestion=()=>spoken++;
+  const turn=s.context.sendAnswer();s.read("platform.interviewEpoch++;state.view='profile';");
+  finish({id:1,question:'后续问题',history:[]});await turn;assert.equal(spoken,0);
+});
+```
+
+### `tests/test_star_display.mjs`
+
+```text
+import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
+const ctx={window:{}};vm.createContext(ctx);for(const file of ['star-graph.js','star-display.js'])vm.runInContext(fs.readFileSync(new URL('../static/'+file,import.meta.url),'utf8'),ctx);
+const G=ctx.window.StarGraph,D=ctx.window.StarDisplay;
+test('总览仅保留起点到职业的导航线，不展开共享技能',()=>{const g=G.demo(),p=D.plan(g,{});assert.equal(p.skillIds.size,0);assert.equal(p.edges.length,9);assert.ok(p.edges.every(e=>e.from==='student'&&e.navigation));assert.equal(p.groups.length,0);});
+test('职业默认分组折叠，阶段导航不冒充真实前置关系',()=>{const g=G.demo(),p=D.plan(g,{focus:'career_frontend'});assert.equal(p.skillIds.size,0);assert.equal(p.groups.length,4);assert.equal(p.edges.length,5);assert.ok(p.edges.every(e=>e.navigation));assert.equal(p.groups.reduce((a,b)=>a+b.count,0),G.required(g,g.careers[0]).size);});
+test('点击技能只显示一跳真实依赖，不展开所有祖先连线',()=>{const g=G.demo(),p=D.plan(g,{focus:'career_frontend',selected:'skill_frontend'});const real=p.edges.filter(e=>!e.navigation);assert.equal(real.length,4);assert.ok(real.every(e=>e.from==='skill_frontend'||e.to==='skill_frontend'));assert.ok(p.skillIds.has('http'));assert.ok(!real.some(e=>e.from==='cs'));});
+test('手动展开阶段可见该组技能，完整模式恢复全部依赖且不修改源图',()=>{const g=G.demo(),before=JSON.stringify(g),p=D.plan(g,{focus:'career_frontend',expanded:[0]});assert.equal(p.groups[0].expanded,true);assert.ok(p.skillIds.has('cs'));const full=D.plan(g,{focus:'career_frontend',full:true});assert.equal(full.groups.length,0);assert.equal(full.skillIds.size,G.required(g,g.careers[0]).size);assert.ok(full.edges.some(e=>e.from==='cs'&&e.to==='code'&&!e.navigation));assert.equal(JSON.stringify(g),before);});
+
+test('隐式展开的阶段点收起后真正折叠，下一次点击才展开',()=>{const g=G.demo(),selected=D.plan(g,{focus:'career_frontend',selected:'skill_frontend'});assert.equal(selected.groups.find(g=>g.index===2).expanded,true);const next=D.nextExpanded([],2,true);assert.equal(next.length,0);const closed=D.plan(g,{focus:'career_frontend',expanded:next});assert.equal(closed.groups.find(g=>g.index===2).expanded,false);assert.equal(closed.skillIds.size,0);assert.deepEqual([...D.nextExpanded(next,2,false)],[2]);});
+```
+
+### `tests/test_star_graph.mjs`
+
+```text
+import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import vm from 'node:vm';
+const ctx={window:{}};vm.createContext(ctx);vm.runInContext(fs.readFileSync(new URL('../static/star-graph.js',import.meta.url),'utf8'),ctx);const G=ctx.window.StarGraph;
+test('九职业只来自演示数据，共享技能和依赖可汇合',()=>{const g=G.decorate(G.demo(),[]);assert.equal(g.careers.length,9);assert.equal(new Set(g.nodes.map(n=>n.id)).size,g.nodes.length);assert.ok(g.nodes.find(n=>n.id==='http').shared_count>3);for(const n of g.nodes)for(const p of n.prerequisites)assert.ok(g.nodes.some(x=>x.id===p));});
+test('动态两职业保持两职业，覆盖率按必备技能依赖闭包计算',()=>{const g=G.demo();g.careers=g.careers.slice(0,2);const d=G.decorate(g,['cs','code']);assert.equal(d.careers.length,2);const c=d.careers[0];assert.equal(c.coverage,Math.round(2/c.required_count*1000)/10);assert.equal(d.nodes.find(n=>n.id==='http').status,'locked');const map=G.layout(d);assert.equal([...map.points.values()].filter(x=>x.kind==='career').length,2);});
+test('职业聚焦复用原技能ID，不复制子树；完成状态解锁后续',()=>{const g=G.demo(),c=g.careers[0],ids=G.required(g,c),view=G.layout(g,c.id);assert.ok(ids.has('cs'));assert.equal(view.visible.size,ids.size);assert.equal(view.points.size,ids.size+2);const d=G.decorate(g,[...ids]);assert.equal(d.careers[0].coverage,100);assert.equal(d.nodes.find(n=>n.id==='proj_frontend').status,'completed');});
+
+test('密集节点自动分开，拖动落点避开已有节点',()=>{const points=new Map(Array.from({length:24},(_,i)=>['n'+i,{x:950,y:850,kind:i?'skill':'student'}]));const layout=G.separate({points,width:1900,height:1700},.35);const all=[...layout.points.values()];all.forEach((a,i)=>all.slice(i+1).forEach(b=>assert.equal(G.overlaps(a,b,.35),false)));const drop=G.freePosition(all[0],all,.35);assert.ok(all.every(p=>!G.overlaps(drop,p,.35)));});
+```
+
 ### `tests/test_tree_canvas.mjs`
 
 ```text
@@ -3707,13 +4258,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 const source=fs.readFileSync(new URL('../static/tree-canvas.js',import.meta.url),'utf8');
-function setup(){
+function setup(options={}){
  const handlers={},selected=[],classes=new Set();let clears=0;
  const viewport={scrollLeft:100,scrollTop:90,scrollWidth:1000,scrollHeight:800,clientWidth:400,clientHeight:300,
  classList:{add:x=>classes.add(x),remove:x=>classes.delete(x)},addEventListener:(k,f)=>handlers[k]=f,
  setPointerCapture(){},releasePointerCapture(){},hasPointerCapture:()=>true};
  const context={window:{}};vm.createContext(context);vm.runInContext(source,context);
- const api=context.window.TreeCanvas.attach(viewport,{onSelect:id=>selected.push(id),onClear:()=>clears++});
+ const api=context.window.TreeCanvas.attach(viewport,{onSelect:id=>selected.push(id),onClear:()=>clears++,...options});
  const target=id=>({closest:selector=>selector==='[data-skill-id]'&&id?{dataset:{skillId:id}}:null});
  function fire(type,{x=100,y=100,id=null,pointerId=1,...extra}={}){let stopped=false;handlers[type]?.({button:0,isPrimary:true,pointerId,clientX:x,clientY:y,detail:1,target:target(id),preventDefault(){stopped=true;},stopImmediatePropagation(){stopped=true;},...extra});return stopped;}
  return {viewport,selected,classes,api,fire,get clears(){return clears;}};
@@ -3725,6 +4276,9 @@ test('取消手势后不残留拖动，键盘点击可正常选中',()=>{const s
 test('第二根手指中断平移，复位取消进行中的手势',()=>{const s=setup();s.fire('pointerdown',{pointerType:'touch'});s.fire('pointerdown',{pointerId:2,isPrimary:false,pointerType:'touch'});s.fire('pointermove',{x:20});assert.equal(s.viewport.scrollLeft,100);s.fire('pointerup',{pointerId:2});s.fire('pointerup');s.fire('pointerdown');s.fire('pointermove',{x:30});s.api.cancel();assert.ok(!s.classes.has('dragging'));s.fire('pointermove',{x:0});assert.equal(s.viewport.scrollLeft,170);});
 
 test('指针捕获将点击目标改为画布时，仍选择按下的节点',()=>{const s=setup();s.fire('pointerdown',{id:'n1'});s.fire('pointerup');s.fire('lostpointercapture');s.fire('click');assert.deepEqual(s.selected,['n1']);assert.equal(s.clears,0);});
+
+test('拖动节点只通知节点坐标变化，不平移画布且不误点',()=>{const moves=[],ends=[];const s=setup({onNodeDragMove:(id,dx,dy)=>moves.push([id,dx,dy]),onNodeDragEnd:(id,cancelled)=>ends.push([id,cancelled])});s.fire('pointerdown',{id:'n1'});s.fire('pointermove',{x:150,y:130,id:'n1'});s.fire('pointerup',{x:150,y:130});s.fire('click');assert.equal(s.viewport.scrollLeft,100);assert.deepEqual(moves,[['n1',50,30]]);assert.deepEqual(ends,[['n1',false]]);assert.equal(s.clears,0);});
+test('滚轮缩放传递鼠标锚点并阻止页面滚动',()=>{const events=[];const s=setup({onZoom:event=>events.push(event)});assert.ok(s.fire('wheel',{x:150,y:180,deltaY:-100,deltaMode:0}));assert.equal(events[0].clientX,150);assert.equal(events[0].deltaY,-100);});
 ```
 
 ### `tests/conftest.py`
@@ -4527,6 +5081,102 @@ def test_existing_jobs_require_review(tmp_path,monkeypatch):
         assert [(r['owner_id'],r['status']) for r in rows]==[(1,'approved'),(2,'pending')]
     with connect() as db:
         assert db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0]==2
+
+
+def star_fixture():
+    return {'title':'动态成长星图','summary':'测试两个方向共享基础技能','nodes':[
+        {'id':'base','name':'Python基础','description':'编程基础','stage':'公共基础技能','prerequisites':[],'resources':['课程：待补充'],'task':'编写程序'},
+        {'id':'api','name':'接口实践','description':'实现接口','stage':'项目实战','prerequisites':['base'],'resources':['文档：待补充'],'task':'交付接口'}],
+        'careers':[{'id':'backend','name':'后端开发','description':'构建服务','core_skill_ids':['base','api'],'projects':['接口项目']},
+                   {'id':'automation','name':'自动化开发','description':'构建工具','core_skill_ids':['base'],'projects':['脚本项目']}]}
+
+
+def test_dynamic_starmap_schema_and_coverage():
+    from app.services import growth,starmap
+    raw=star_fixture();tree=growth.Tree.model_validate(raw).model_dump()
+    view=starmap.decorate(tree,['base'])
+    assert len(view['careers'])==2
+    assert view['careers'][0]['coverage']==50
+    assert view['careers'][1]['coverage']==100
+    assert view['nodes'][1]['status']=='available'
+    assert starmap.decorate(tree,[])['nodes'][1]['status']=='locked'
+    raw['careers'][0]['core_skill_ids']=['unknown']
+    with pytest.raises(ValueError):growth.Tree.model_validate(raw)
+
+
+def test_starmap_exam_unlock_is_server_verified(client,monkeypatch):
+    from app.services import growth
+    register(client)
+    monkeypatch.setattr(growth,'generate_json',lambda *a,**kw:star_fixture())
+    tree=client.post('/api/learning/tree',json={'occupation':'开发方向','consent':True}).json();tid=tree['id']
+    assert client.put(f'/api/learning/trees/{tid}/progress',json={'completed':['base']}).status_code==422
+    assert client.post('/api/learning/exams',json={'tree_id':tid,'node_ids':['api'],'unlock':True,'consent':True}).status_code==422
+    questions={'questions':[{'question':f'基础选择题 {i}？','options':['正确选项','选项二','选项三','选项四'],'answer':0,'explanation':'课程基础知识','skill':'Python基础'} for i in range(3)]}
+    monkeypatch.setattr(growth,'generate_json',lambda *a,**kw:questions)
+    exam=client.post('/api/learning/exams',json={'tree_id':tid,'node_ids':['base'],'unlock':True,'consent':True})
+    assert exam.status_code==200,exam.text
+    result=client.post('/api/learning/exams/'+str(exam.json()['id'])+'/submit',json={'answers':[0,0,0]}).json()
+    assert result['unlocked']==['base']
+    assert result['tree_id']==tid
+    latest=client.get('/api/learning/trees').json()['items'][0]
+    assert latest['progress']==['base']
+    assert latest['tree']['careers'][0]['coverage']==50
+    assert client.post('/api/learning/exams/'+str(exam.json()['id'])+'/submit',json={'answers':[0,0,0]}).status_code==409
+
+
+def test_starmap_failed_exam_cannot_unlock(client,monkeypatch):
+    from app.services import growth
+    register(client);monkeypatch.setattr(growth,'generate_json',lambda *a,**kw:star_fixture())
+    tree=client.post('/api/learning/tree',json={'occupation':'开发','consent':True}).json()
+    questions={'questions':[{'question':f'基础选择题 {i}？','options':['正确选项','选项二','选项三','选项四'],'answer':0,'explanation':'课程基础知识','skill':'Python基础'} for i in range(3)]}
+    monkeypatch.setattr(growth,'generate_json',lambda *a,**kw:questions)
+    exam=client.post('/api/learning/exams',json={'tree_id':tree['id'],'node_ids':['base'],'unlock':True,'consent':True}).json()
+    result=client.post('/api/learning/exams/'+str(exam['id'])+'/submit',json={'answers':[0,0,1]}).json()
+    assert result['unlocked']==[]
+    assert client.get('/api/learning/trees').json()['items'][0]['progress']==[]
+
+
+def test_starmap_rejects_disconnected_career_copies():
+    from app.services import growth
+    raw=star_fixture()
+    raw['nodes'][1]['prerequisites']=[]
+    raw['careers'][0]['core_skill_ids']=['api']
+    with pytest.raises(ValueError):growth.Tree.model_validate(raw)
+
+
+def test_starmap_practice_and_legacy_records_do_not_grant_unlock(client,monkeypatch):
+    from app.services import growth
+    from app.database import connect
+    register(client);monkeypatch.setattr(growth,'generate_json',lambda *a,**kw:star_fixture())
+    tree=client.post('/api/learning/tree',json={'occupation':'开发','consent':True}).json();tid=tree['id']
+    with connect() as db:db.execute('UPDATE trees SET progress=? WHERE id=?',('["base"]',tid))
+    assert client.get('/api/learning/trees').json()['items'][0]['progress']==[]
+    q={'questions':[{'question':'基础选择题是什么？','options':['正确选项','选项二','选项三','选项四'],'answer':0,'explanation':'基础知识','skill':'Python基础'}]}
+    monkeypatch.setattr(growth,'generate_json',lambda *a,**kw:q)
+    body={'tree_id':tid,'node_ids':['base'],'consent':True}
+    assert client.post('/api/learning/exams',json={**body,'unlock':True}).status_code==502
+    practice=client.post('/api/learning/exams',json=body).json()
+    result=client.post('/api/learning/exams/'+str(practice['id'])+'/submit',json={'answers':[0]}).json()
+    assert result['score']==100 and result['unlocked']==[]
+    assert client.get('/api/learning/trees').json()['items'][0]['progress']==[]
+    with connect() as db:assert db.execute('SELECT progress FROM trees WHERE id=?',(tid,)).fetchone()[0]=='["base"]'
+
+
+def test_starmap_accepts_any_major_and_preserves_learner_context(client,monkeypatch):
+    from app.services import growth
+    register(client);captured={}
+    def model(task,data,schema):
+        captured.update(data)
+        return {'title':'视觉设计成长星图','summary':'设计专业路径','learner_label':'视觉传达设计学习者','nodes':[
+            {'id':'visual','name':'视觉基础','stage':'公共基础技能','description':'构图与色彩基础','prerequisites':[],'resources':['课程：待补充'],'task':'完成视觉分析'}],
+            'careers':[{'id':'brand','name':'品牌设计','description':'视觉系统设计','core_skill_ids':['visual'],'projects':['品牌视觉手册']}]}
+    monkeypatch.setattr(growth,'generate_json',model)
+    r=client.post('/api/learning/tree',json={'major':'视觉传达设计','occupation':'品牌设计','consent':True})
+    assert r.status_code==200,r.text
+    assert captured['major']=='视觉传达设计'
+    assert r.json()['major']=='视觉传达设计'
+    assert '视觉传达' in r.json()['tree']['learner_label']
+    assert client.get('/api/learning/trees').json()['items'][0]['major']=='视觉传达设计'
 ```
 
 ### `tests/test_surfaces.py`
@@ -4836,3 +5486,11 @@ career-guard/
 ## 岗位审核
 
 普通用户提交和修改岗位后进入待审核，仅本人可在“我的岗位提交”查看。管理员在独立后台“岗位审核与维护”中查看完整描述、通过或填写原因拒绝；通过后才进入公开岗位列表。审核只表示允许展示，不代表真实性担保。管理员直接发布的岗位即时展示。旧版数据库自动为管理员岗位保留展示，普通用户岗位转入待审核，不删除原有记录。
+
+## 动态职业成长星图
+
+技能树已升级为深色星图：正式模式由AI根据岗位、JD和缺口动态生成共享技能及职业方向；只有演示模式预置九方向。通过节点考核（至少3题、正确率80%、前置已完成）才记录完成，职业面板显示依赖闭包上的技能覆盖率，不提供录用概率。旧自记进度保留，新考核进度独立保存。演示加载/重置只影响页面内存。详见 [星图说明](docs/STARMAP.md)。
+
+## v0.9.0：分层星图
+
+总览只展示职业导航，进入职业后按阶段折叠；点击技能查看直接前置与后续，按需开启完整依赖。支持阶段展开/收起，保留节点拖动与滚轮缩放。详情见 [连线简化说明](docs/STARMAP_SIMPLIFICATION.md)，历史见 [版本记录](CHANGELOG.md)。

@@ -2,7 +2,7 @@
 window.StarMap=(()=>{
   const palette=['#87adf2','#b19cea','#74c8bd','#a6a1ee','#d1a1bb','#8ebbd3','#aecb93','#c6ad89','#92a5d7'];
   const glyphs=['⌘','⬡','▥','✦','◇','☁','✓','▯','⌁'];
-  const S={mode:'live',graph:null,progress:[],focus:null,selected:null,zoom:1,layout:null,initialized:false,achievementTimer:null,pendingAchievements:[],positions:new Map(),drag:null,dragFrame:0,wheelFrame:0,wheelDelta:0,settleTimer:0};
+  const S={mode:'live',graph:null,progress:[],focus:null,selected:null,zoom:1,layout:null,initialized:false,achievementTimer:null,pendingAchievements:[],positions:new Map(),drag:null,dragFrame:0,wheelFrame:0,wheelDelta:0,settleTimer:0,full:false,expanded:new Set(),display:null};
   const get=id=>document.getElementById(id),el=(tag,cls='',value='')=>node(tag,cls,value);
   function setText(id,value){get(id).textContent=value;}
   function careerIndex(id){return Math.max(0,S.graph.careers.findIndex(c=>c.id===id));}
@@ -15,17 +15,18 @@ window.StarMap=(()=>{
     get('tree-workspace').hidden=false;
   }
   function load(value){
-    platform.canvas?.cancel();S.mode='live';S.graph=value.tree;S.progress=[...value.progress];S.focus=null;S.selected=null;platform.tree=value;
+    platform.canvas?.cancel();S.full=false;S.expanded.clear();S.mode='live';S.graph=value.tree;S.progress=[...value.progress];S.focus=null;S.selected=null;platform.tree=value;
     setText('tree-title',value.tree.title);setText('tree-state','完成节点考核后解锁后续技能，旧版自我记录不作为考核结果。');
     get('tree-config').open=false;modeUI();draw(true);
   }
   function switchMode(mode){
     platform.canvas?.cancel();if(mode==='demo'){
-      S.mode='demo';S.graph=StarGraph.demo();S.progress=[];S.focus=null;S.selected=null;get('tree-config').open=false;modeUI();draw(true);
+      S.mode='demo';S.full=false;S.expanded.clear();S.graph=StarGraph.demo();S.progress=[];S.focus=null;S.selected=null;get('tree-config').open=false;modeUI();draw(true);
     }else if(platform.tree)load(platform.tree);
     else{S.mode='live';S.graph=null;S.progress=[];S.selected=null;S.focus=null;modeUI();drawEmpty();get('tree-config').open=true;}
   }
   function drawEmpty(){
+    get('star-stage-list').hidden=true;get('star-stage-list').replaceChildren();get('star-dependency-toggle').disabled=true;get('star-dependency-toggle').setAttribute('aria-pressed','false');get('star-dependency-toggle').textContent='完整依赖';
     const scene=get('tree-scene'),space=get('tree-space');scene.replaceChildren();scene.style.cssText='';space.style.cssText='';
     const empty=el('div','star-empty');empty.append(el('span','','✧'),el('h2','','你的成长星图，由你定义'),el('p','','输入目标岗位和已有基础，让 AI 连接你的技能与职业方向。也可以先探索九方向演示。'));
     const b=el('button','','探索演示星图');b.type='button';b.addEventListener('click',()=>switchMode('demo'));empty.append(b);scene.append(empty);scene.style.height='620px';scene.style.width='100%';
@@ -36,28 +37,36 @@ window.StarMap=(()=>{
     setText('tree-title',g.title);setText('tree-progress',completed+' / '+total+' 项');setText('star-level','LV.'+String(level).padStart(2,'0'));
     setText('star-level-name',completed===0?(g.learner_label||'学习者成长起点')+' · 探索者':completed<8?'基础积累 · 持续进阶':completed<18?'技能连接 · 实践成长':'项目进阶 · 职业探索');
     setText('star-career-count',g.careers.length);get('star-progress-fill').style.transform='scaleX('+(total?completed/total:0)+')';
-    const c=g.careers.find(c=>c.id===S.focus);setText('star-focus-label',c?c.name+' · 技能路径':'职业总览');setText('tree-summary',c?'共享基础 → 方向探索 → 专业能力 → 项目实战':'点击职业方向，展开共享技能与汇合路径。');
+    const c=g.careers.find(c=>c.id===S.focus);setText('star-focus-label',c?c.name+' · 技能路径':'职业总览');
+    const selected=g.nodes.some(n=>n.id===S.selected);
+    setText('tree-summary',!c?'总览收起共享技能连线，点击职业逐层探索。':S.full?'显示此职业的全部真实依赖。':selected?'仅显示当前技能的直接前置与后续关系。':'阶段主干为导航示意，展开后选择技能查看真实依赖。');
+    const toggle=get('star-dependency-toggle');toggle.disabled=!c;toggle.setAttribute('aria-pressed',String(S.full&&Boolean(c)));toggle.textContent=S.full&&c?'收起完整依赖':'完整依赖';
+    const stages=get('star-stage-list');stages.replaceChildren();stages.hidden=!c||S.full;
+    if(c)for(const group of S.display.groups){const b=el('button','',`${group.stage} · ${group.count}项 ${group.expanded?'收起':'展开'}`);b.type='button';b.dataset.starStage=String(group.index);b.setAttribute('aria-expanded',String(group.expanded));stages.append(b);}
+
   }
   function layoutKey(){return S.mode+':'+(S.mode==='live'?platform.tree?.id:'sample')+':'+(S.focus||'overview');}
-  function displayedIds(){return new Set([...S.layout.points].filter(([id,p])=>p.kind!=='skill'||S.focus||S.zoom>=.32).map(([id])=>id));}
+  function displayedIds(){return new Set(S.layout.points.keys());}
   function fitZoom(){const vp=get('tree-scroll');return Math.max(.2,Math.min(.9,vp.clientWidth/1900*.98,vp.clientHeight/1700*.98));}
   function draw(fit=false){
     if(!S.graph){drawEmpty();return;}
     platform.canvas?.cancel();const g=view();S.layout=StarGraph.layout(g,S.focus);
+    S.display=window.StarDisplay.plan(g,{focus:S.focus,selected:S.selected,full:S.full,expanded:[...S.expanded]});
+    for(const [id,p] of S.layout.points)if(p.kind==='skill'&&!S.display.skillIds.has(id))S.layout.points.delete(id);
+    S.display.groups.forEach(group=>{const angle=-Math.PI*.75+group.index*.85,radius=[240,350,470,580][group.index];S.layout.points.set(group.id,{kind:'group',x:S.layout.cx+Math.cos(angle)*radius,y:S.layout.cy+Math.sin(angle)*radius});});
     if(fit)S.zoom=S.focus?Math.max(.4,fitZoom()):fitZoom();
     S.layout=StarGraph.separate(S.layout,S.zoom,S.positions.get(layoutKey())||new Map(),displayedIds());
     const scene=get('tree-scene');scene.replaceChildren();scene.style.width=S.layout.width+'px';scene.style.height=S.layout.height+'px';
     const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('width',S.layout.width);svg.setAttribute('height',S.layout.height);svg.setAttribute('aria-hidden','true');scene.append(svg);
     for(const [id,p] of S.layout.points){
-      const n=g.nodes.find(n=>n.id===id),c=g.careers.find(c=>c.id===id);
-      // 小屏总览只展示中心与职业星座；真实基础技能在聚焦视图完整展开。
-      if(!S.focus&&n&&S.zoom<.32)continue;
+      const n=g.nodes.find(n=>n.id===id),c=g.careers.find(c=>c.id===id),group=S.display.groups.find(group=>group.id===id);
       const kind=p.kind,b=el('button','star-node '+kind+(n?' '+n.status:c&&c.coverage===100?' completed':''));b.type='button';b.dataset.skillId=id;
       b.style.left=(p.x-56)+'px';b.style.top=(p.y-52.5)+'px';b.style.width='112px';
-      const orb=el('span','star-orb',kind==='student'?'⌘':kind==='career'?theme(id).glyph:n.status==='completed'?'✓':n.status==='locked'?'⌑':StarGraph.stages.indexOf(n.stage)===3?'⬡':'✧');orb.setAttribute('aria-hidden','true');b.append(orb);
-      const label=kind==='student'?(g.learner_label||'学习者成长起点'):n?n.name:c.name;b.append(el('span','star-node-label',label));
-      b.append(el('span','star-node-meta',kind==='student'?'成长起点':c?'技能覆盖率 '+c.coverage+'%':n.shared_count>1?'共享于 '+n.shared_count+' 个方向':n.status==='locked'?'前置待完成':n.status==='completed'?'考核完成':'可以学习'));
-      b.setAttribute('aria-label',label+(n?'，'+({locked:'未解锁',available:'可学习',completed:'已完成'}[n.status]):c?'，技能覆盖率'+c.coverage+'%':''));b.setAttribute('aria-pressed',String(S.selected===id));
+      const orb=el('span','star-orb',kind==='student'?'⌘':kind==='group'?'⋯':kind==='career'?theme(id).glyph:n.status==='completed'?'✓':n.status==='locked'?'⌑':StarGraph.stages.indexOf(n.stage)===3?'⬡':'✧');orb.setAttribute('aria-hidden','true');b.append(orb);
+      const label=kind==='student'?(g.learner_label||'学习者成长起点'):group?group.stage:n?n.name:c.name;b.append(el('span','star-node-label',label));
+      b.append(el('span','star-node-meta',kind==='student'?'成长起点':group?(group.expanded?'点击收起 '+group.count+' 项':group.hiddenCount?'还有 '+group.hiddenCount+' 项技能':'该阶段技能已显示'):c?'技能覆盖率 '+c.coverage+'%':n.shared_count>1?'共享于 '+n.shared_count+' 个方向':n.status==='locked'?'前置待完成':n.status==='completed'?'考核完成':'可以学习'));
+      if(group)b.setAttribute('aria-expanded',String(group.expanded));
+      b.setAttribute('aria-label',label+(group?'，'+group.count+'项技能，'+(group.expanded?'点击收起':'点击展开'):n?'，'+({locked:'未解锁',available:'可学习',completed:'已完成'}[n.status]):c?'，技能覆盖率'+c.coverage+'%':''));b.setAttribute('aria-pressed',String(S.selected===id));
       if(c)b.style.setProperty('--career-color',theme(id).color);scene.append(b);
     }
     applyZoom(fit);updateHUD(g);highlight();renderDetail();
@@ -84,16 +93,13 @@ window.StarMap=(()=>{
     function link(from,to,state,aggregate=false){
       const d=pathFor(from,to,aggregate);if(!d)return;
       const p=make('path');p.dataset.from=from;p.dataset.to=to;p.dataset.aggregate=String(aggregate);p.setAttribute('d',d);p.setAttribute('class','path-'+(aggregate?'overview':state));p.setAttribute('vector-effect','non-scaling-stroke');p.setAttribute('marker-end','url(#star-arrow)');svg.append(p);
-      if(state==='completed'&&!aggregate&&!noMotion&&particles<6){const dot=make('circle');dot.setAttribute('r',2/S.zoom);dot.setAttribute('class','star-energy');const motion=make('animateMotion');motion.setAttribute('path',d);motion.setAttribute('dur',(3+particles*.3)+'s');motion.setAttribute('repeatCount','3');dot.append(motion);svg.append(dot);particles++;}
+      if(state==='completed'&&!aggregate&&!noMotion&&particles<2&&S.selected&&(from===S.selected||to===S.selected)){const dot=make('circle');dot.setAttribute('r',2/S.zoom);dot.setAttribute('class','star-energy');const motion=make('animateMotion');motion.setAttribute('path',d);motion.setAttribute('dur',(3+particles*.3)+'s');motion.setAttribute('repeatCount','3');dot.append(motion);svg.append(dot);particles++;}
     }
-    if(!S.focus){
-      const foundation=g.nodes.filter(n=>S.layout.visible.has(n.id)&&S.zoom>=.32);
-      foundation.forEach(n=>link('student',n.id,n.status==='completed'?'completed':'locked',true));
-      for(const c of g.careers){const ids=StarGraph.required(g,c),sources=foundation.filter(n=>ids.has(n.id));(sources.length?sources.map(n=>n.id):['student']).forEach(id=>link(id,c.id,c.coverage===100?'completed':'locked',true));}
-    }else{
-      g.nodes.filter(n=>S.layout.visible.has(n.id)).forEach(n=>{const state=n.status==='completed'?'completed':n.status==='available'?'ready':'locked';if(!n.prerequisites.length)link('student',n.id,state);n.prerequisites.forEach(id=>link(id,n.id,state));});
-      const c=g.careers.find(c=>c.id===S.focus),parents=new Set(g.nodes.filter(n=>S.layout.visible.has(n.id)).flatMap(n=>n.prerequisites));[...S.layout.visible].filter(id=>!parents.has(id)).forEach(id=>link(id,c.id,c.coverage===100?'completed':'locked'));
-    }
+    S.display.edges.forEach(edge=>{
+      const n=g.nodes.find(n=>n.id===edge.to),c=g.careers.find(c=>c.id===edge.to);
+      const state=n?(n.status==='completed'?'completed':n.status==='available'?'ready':'locked'):c&&c.coverage===100?'completed':'locked';
+      link(edge.from,edge.to,state,edge.navigation);
+    });
     highlight();
   }
   function highlight(){
@@ -101,13 +107,15 @@ window.StarMap=(()=>{
     document.querySelectorAll('#tree-scene path[data-from]').forEach(p=>p.classList.toggle('emphasized',Boolean(S.selected)&&(p.dataset.from===S.selected||p.dataset.to===S.selected)));
   }
   function select(id){
-    if(!S.graph)return;const career=S.graph.careers.find(c=>c.id===id);
-    if(career&&S.focus!==id){S.focus=id;S.selected=id;draw(true);[...get('tree-scene').querySelectorAll('[data-skill-id]')].find(b=>b.dataset.skillId===id)?.focus({preventScroll:true});return;}
+    if(!S.graph)return;const group=S.display?.groups.find(g=>g.id===id);if(group){toggleStage(group.index);return;}const career=S.graph.careers.find(c=>c.id===id);
+    if(career&&S.focus!==id){S.full=false;S.expanded.clear();S.focus=id;S.selected=id;draw(true);[...get('tree-scene').querySelectorAll('[data-skill-id]')].find(b=>b.dataset.skillId===id)?.focus({preventScroll:true});return;}
     if(id==='student'){overview();return;}
-    const panelFocus=get('star-detail-body').contains(document.activeElement);S.selected=id;highlight();renderDetail();if(panelFocus){get('star-detail-body').tabIndex=-1;get('star-detail-body').focus({preventScroll:true});}
+    const panelFocus=get('star-detail-body').contains(document.activeElement);S.selected=id;draw();if(!panelFocus)[...get('tree-scene').querySelectorAll('[data-skill-id]')].find(b=>b.dataset.skillId===id)?.focus({preventScroll:true});if(panelFocus){get('star-detail-body').tabIndex=-1;get('star-detail-body').focus({preventScroll:true});}
   }
-  function clear(){S.selected=null;highlight();renderDetail();}
-  function overview(){S.focus=null;S.selected=null;draw(true);}
+  function clear(){S.selected=null;draw();}
+  function overview(){S.full=false;S.expanded.clear();S.focus=null;S.selected=null;draw(true);}
+  function toggleStage(index){if(!S.focus)return;const canvasFocus=get('tree-scene').contains(document.activeElement);S.full=false;S.selected=null;S.expanded=new Set(window.StarDisplay.nextExpanded([...S.expanded],index,Boolean(S.display.groups.find(g=>g.index===index)?.expanded)));draw();const target=canvasFocus?[...get('tree-scene').querySelectorAll('[data-skill-id]')].find(b=>b.dataset.skillId==='@stage:'+index):[...get('star-stage-list').querySelectorAll('button')].find(b=>b.dataset.starStage===String(index));target?.focus({preventScroll:true});}
+  function dependencies(){if(!S.focus)return;S.full=!S.full;draw();}
   function addHeading(root,label,values){root.append(el('h3','',label));const ul=el('ul');values.forEach(value=>ul.append(el('li','',value)));root.append(ul);}
   function skillButtons(root,ids,g){const list=el('div','star-skill-list');ids.forEach(id=>{const n=g.nodes.find(n=>n.id===id);if(!n)return;const b=el('button','',`${n.status==='completed'?'✓':n.status==='available'?'✧':'○'} ${n.name}`);b.type='button';b.addEventListener('click',()=>select(id));list.append(b);});root.append(list);}
   function renderDetail(){
@@ -155,7 +163,7 @@ window.StarMap=(()=>{
     const sx=anchor?anchor.clientX-rect.left-vp.clientLeft:vp.clientWidth/2,sy=anchor?anchor.clientY-rect.top-vp.clientTop:vp.clientHeight/2;
     const wx=(vp.scrollLeft+sx-scene.offsetLeft)/old,wy=(vp.scrollTop+sy-scene.offsetTop)/old;
     S.zoom=Math.max(.2,Math.min(1.8,next));
-    if(!S.focus&&((old<.32)!==(S.zoom<.32)))draw();else applyZoom();
+    applyZoom();
     vp.scrollLeft=scene.offsetLeft+wx*S.zoom-sx;vp.scrollTop=scene.offsetTop+wy*S.zoom-sy;
     clearTimeout(S.settleTimer);S.settleTimer=setTimeout(()=>{
       if(!S.graph||S.drag)return;
@@ -194,12 +202,12 @@ window.StarMap=(()=>{
     applyZoom();
   }
   function arrange(){if(!S.graph)return;S.positions.delete(layoutKey());draw(true);}
-  function reset(){if(S.mode!=='demo')return;[...S.positions.keys()].filter(k=>k.startsWith('demo:')).forEach(k=>S.positions.delete(k));S.progress=[];S.focus=null;S.selected=null;S.pendingAchievements=[];get('star-achievement').hidden=true;draw(true);toast('演示已重置，个人学习记录未修改。');}
+  function reset(){if(S.mode!=='demo')return;[...S.positions.keys()].filter(k=>k.startsWith('demo:')).forEach(k=>S.positions.delete(k));S.full=false;S.expanded.clear();S.progress=[];S.focus=null;S.selected=null;S.pendingAchievements=[];get('star-achievement').hidden=true;draw(true);toast('演示已重置，个人学习记录未修改。');}
   function init(){
     if(S.initialized)return;S.initialized=true;modeUI();drawEmpty();
     document.querySelector('#view-tree').addEventListener('pointerdown',()=>document.body.classList.remove('star-keyboard'));
     document.querySelector('#view-tree').addEventListener('keydown',()=>document.body.classList.add('star-keyboard'));
-    document.querySelector('#view-tree').addEventListener('click',event=>{const b=event.target.closest('[data-star]');if(!b)return;const actions={live:()=>switchMode('live'),demo:()=>switchMode('demo'),overview,clear,sample,reset,arrange,center:()=>draw(true),'zoom-in':()=>zoom(.1),'zoom-out':()=>zoom(-.1)};actions[b.dataset.star]?.();});
+    document.querySelector('#view-tree').addEventListener('click',event=>{const b=event.target.closest('[data-star]');if(!b){const stage=event.target.closest('[data-star-stage]');if(stage)toggleStage(Number(stage.dataset.starStage));return;}const actions={live:()=>switchMode('live'),demo:()=>switchMode('demo'),overview,clear,sample,reset,arrange,dependencies,center:()=>draw(true),'zoom-in':()=>zoom(.1),'zoom-out':()=>zoom(-.1)};actions[b.dataset.star]?.();});
     get('tree-scroll').addEventListener('keydown',event=>{
       if(event.key==='Home'){event.preventDefault();draw(true);get('tree-scroll').focus({preventScroll:true});return;}if(event.key==='+'||event.key==='='){event.preventDefault();zoom(.1);return;}if(event.key==='-'){event.preventDefault();zoom(-.1);return;}
       const current=event.target.closest('[data-skill-id]');if(current&&event.altKey&&['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)){event.preventDefault();const dx=event.key==='ArrowLeft'?-32:event.key==='ArrowRight'?32:0,dy=event.key==='ArrowUp'?-32:event.key==='ArrowDown'?32:0;dragNode(current.dataset.skillId,dx,dy);endNodeDrag(current.dataset.skillId);return;}if(!current||!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)||!S.layout)return;
@@ -209,6 +217,6 @@ window.StarMap=(()=>{
     let resizeFrame=0;window.addEventListener('resize',()=>{cancelAnimationFrame(resizeFrame);resizeFrame=requestAnimationFrame(()=>{if(state.view==='tree'&&S.graph)draw(true);});});
     window.addEventListener('viewchange',event=>{document.body.classList.toggle('star-theme',event.detail==='tree');if(event.detail==='tree')showAchievement();else get('star-achievement').hidden=true;});
   }
-  function clearAll(){platform.canvas?.cancel();cancelAnimationFrame(S.wheelFrame);cancelAnimationFrame(S.dragFrame);clearTimeout(S.settleTimer);S.wheelFrame=0;S.dragFrame=0;S.drag=null;S.positions.clear();S.graph=null;S.progress=[];S.focus=null;S.selected=null;S.mode='live';S.pendingAchievements=[];if(S.initialized){modeUI();drawEmpty();}}
+  function clearAll(){platform.canvas?.cancel();cancelAnimationFrame(S.wheelFrame);cancelAnimationFrame(S.dragFrame);clearTimeout(S.settleTimer);S.wheelFrame=0;S.dragFrame=0;S.drag=null;S.positions.clear();S.full=false;S.expanded.clear();S.graph=null;S.progress=[];S.focus=null;S.selected=null;S.mode='live';S.pendingAchievements=[];if(S.initialized){modeUI();drawEmpty();}}
   return {init,load,select,clear,overview,draw,renderDetail,applyExam,clearAll,dragNode,endNodeDrag,wheelZoom,get mode(){return S.mode;}};
 })();
