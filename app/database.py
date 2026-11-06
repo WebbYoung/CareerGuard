@@ -8,6 +8,10 @@ from pathlib import Path
 from contextlib import contextmanager
 from cryptography.fernet import Fernet
 from .config import ROOT
+from .services.model_schema import SCHEMA as MODEL_SCHEMA
+from .services.resume_schema import SCHEMA as RESUME_SCHEMA
+from .services.company_schema import SCHEMA as COMPANY_SCHEMA
+from .services.assistant_schema import SCHEMA as ASSISTANT_SCHEMA
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -36,6 +40,9 @@ CREATE TABLE IF NOT EXISTS career_reports(id INTEGER PRIMARY KEY,user_id INTEGER
 CREATE TABLE IF NOT EXISTS security_events(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id),action TEXT NOT NULL,status TEXT NOT NULL,count INTEGER NOT NULL,created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS analyses(user_id INTEGER NOT NULL REFERENCES users(id),material_id TEXT NOT NULL REFERENCES materials(id) ON DELETE CASCADE,kind TEXT NOT NULL,content TEXT NOT NULL,PRIMARY KEY(user_id,material_id,kind));
 '''
+
+
+SCHEMA += MODEL_SCHEMA + RESUME_SCHEMA + COMPANY_SCHEMA + ASSISTANT_SCHEMA
 
 
 @contextmanager

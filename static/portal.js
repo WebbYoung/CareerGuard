@@ -9,6 +9,7 @@ window.Portal={csrf:'',ready:null,async request(path,{method='GET',data}={}){
 }};
 Portal.ready=fetch('/api/auth/session',{credentials:'same-origin',cache:'no-store'}).then(async r=>{if(!r.ok)throw Error('无法建立会话，请刷新。');Portal.csrf=(await r.json()).csrf_token;});
 Portal.ready.catch(()=>{});
+Portal.destination=role=>role==='admin'?'/admin':role==='company'?'/company':'/app';
 document.querySelectorAll('[data-toggle-password]').forEach(b=>b.addEventListener('click',()=>{const field=document.getElementById('password');field.type=field.type==='password'?'text':'password';b.textContent=field.type==='password'?'显示':'隐藏';}));
 const form=document.getElementById('account-form');
 if(form)form.addEventListener('submit',async event=>{
@@ -21,12 +22,12 @@ if(form)form.addEventListener('submit',async event=>{
     const result=await Portal.request('/auth/'+mode,{method:'POST',data:{username:document.getElementById('username').value.trim(),password}});
     document.getElementById('password').value='';
     const adminTarget=new URLSearchParams(location.search).get('next')==='admin';
-    if(adminTarget&&result.user.role!=='admin'){message.textContent='已登录普通账号，可进入求职工作台；管理后台仅限管理员。';const link=document.createElement('a');link.href='/app';link.textContent='进入工作台 →';message.append(link);return;}
-    location.assign(result.user.role==='admin'?'/admin':'/app');
+    if(adminTarget&&result.user.role!=='admin'){message.textContent='已登录，网站管理后台仅限网站管理员。';const link=document.createElement('a');link.href=Portal.destination(result.user.role);link.textContent=result.user.role==='company'?'进入企业工作台 →':'进入求职工作台 →';message.append(link);return;}
+    location.assign(Portal.destination(result.user.role));
   }catch(error){message.textContent=error.message;}finally{b.disabled=false;}
 });
 if(document.body.dataset.page==='home'){
-  Portal.request('/auth/me').then(({user})=>{if(user){document.querySelectorAll('a[href=\"/demo\"],.hero-footnote').forEach(el=>el.hidden=true);const link=document.getElementById('home-account');link.href=user.role==='admin'?'/admin':'/app';link.textContent='继续使用 ↗';}}).catch(()=>{});
+  Portal.request('/auth/me').then(({user})=>{if(user){document.querySelectorAll('a[href=\"/demo\"],.hero-footnote').forEach(el=>el.hidden=true);const link=document.getElementById('home-account');link.href=Portal.destination(user.role);link.textContent=user.role==='company'?'企业工作台 ↗':'继续使用 ↗';if(user.role==='company')document.querySelectorAll('a[href^="/app"]').forEach(a=>a.href='/company');}}).catch(()=>{});
 }
 if(document.body.dataset.page==='demo'){
   let data,expiry;

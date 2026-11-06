@@ -21,7 +21,7 @@ async function publish(){
 }
 async function init(){
   const {user}=await api('/auth/me');if(!user){location.replace('/login?next=admin');return;}
-  if(user.role!=='admin'){location.replace('/app');return;}platform.user=user;text('#admin-identity',user.username+' · 超级用户');
+  if(user.role!=='admin'){location.replace(Portal.destination(user.role));return;}platform.user=user;text('#admin-identity',user.username+' · 超级用户');
   const response=await fetch('/static/admin-panels.html',{cache:'no-store'});if(!response.ok)throw Error('后台页面加载失败。');
   const template=document.createElement('template');template.innerHTML=await response.text();$('#admin-main').replaceChildren(template.content);
   const publishPanel=node('article','panel spaced');publishPanel.id='admin-publish';publishPanel.append(node('h3','','添加推荐公司岗位'));
@@ -33,6 +33,8 @@ async function init(){
   document.querySelectorAll('#admin-security [data-action=clear]').forEach(b=>b.remove());
   document.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const handlers={'load-admin':loadAdmin,'save-model':saveModel,'test-model':testModel,'refresh-audit':refreshAudit,'check-injection':checkInjection};const fn=handlers[b.dataset.platform||b.dataset.action];if(fn)run(fn,b);if(b.dataset.go==='jobs')$('#admin-publish').scrollIntoView({behavior:'smooth'});});
   await loadAdmin();
+  window.CareerGuardAdminReady=true;
+  document.dispatchEvent(new CustomEvent('admin-loaded'));
 }
 $('#admin-logout').addEventListener('click',()=>run(async()=>{await api('/auth/logout',{method:'POST'});location.assign('/');}));
 init().catch(e=>{if($('#admin-loading'))text('#admin-loading',e.message);else toast(e.message,true);});

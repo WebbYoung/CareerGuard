@@ -1,9 +1,10 @@
-"""固定官方 DeepSeek HTTPS / 本机 Ollama；无任意URL、网页抓取、重定向或工具调用。"""
+"""证据说明通过受限模型网关生成；无网页抓取或模型工具执行。"""
 import http.client
 import json
 import re
 from pydantic import BaseModel, Field, ConfigDict
 from .. import config
+from . import model_gateway as gateway
 from .pii import redact
 from .security import inspect_injection
 
@@ -34,11 +35,10 @@ class ModelServiceError(Exception):
 
 
 def _metadata() -> dict:
-    cloud = config.LLM_PROVIDER == 'deepseek'
-    return {'provider': config.LLM_PROVIDER, 'label': 'DeepSeek 云端' if cloud else '本地 Ollama',
-            'model': config.DEEPSEEK_MODEL if cloud else config.OLLAMA_MODEL, 'remote': cloud,
-            'data_policy': 'AI分析向DeepSeek发送脱敏结构化证据，不上传原始文件或完整简历。' if cloud
-                           else 'AI分析连接本机Ollama，材料不发送至云端模型。'}
+    setting=gateway.get_settings('chat',True)
+    remote=setting['protocol']!='ollama'
+    return {'provider':setting['provider'],'label':setting['provider']+' 模型','model':setting['model'],'remote':remote,
+            'data_policy':'AI分析仅发送脱敏结构化证据，不上传原始文件或完整简历。' if remote else 'AI分析连接本机Ollama。'}
 
 
 def _read_json(response):
@@ -51,74 +51,35 @@ def _read_json(response):
 
 
 def _local_json(path: str, payload: dict | None = None, timeout: float = 1):
-    conn = http.client.HTTPConnection('127.0.0.1', 11434, timeout=timeout)
-    try:
-        body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode('utf-8')
-        conn.request('GET' if payload is None else 'POST', path, body=body,
-                     headers={'Content-Type': 'application/json'})
-        return _read_json(conn.getresponse())
-    finally:
-        conn.close()
+    if path!='/api/generate' or payload is None: raise ValueError('unsupported model operation')
+    settings=gateway.defaults('chat')
+    settings.update(protocol='ollama',base_url='http://127.0.0.1:11434',model=config.OLLAMA_MODEL)
+    data={'model':config.OLLAMA_MODEL,'messages':[{'role':'system','content':payload.get('system','')},{'role':'user','content':payload.get('prompt','')}],
+          'stream':False,'options':payload.get('options',{}),'format':payload.get('format','json')}
+    value=gateway._request(settings,'/api/chat',data)
+    return {'response':value['message']['content']}
 
 
 def _deepseek_prefix() -> str:
-    # 环境地址也严格白名单；用户请求不能设置此值。禁止用户名、非443端口、任意路径等。
-    base = config.DEEPSEEK_BASE_URL.rstrip('/')
-    if base not in {'https://api.deepseek.com', 'https://api.deepseek.com/v1'}:
-        raise ValueError('DeepSeek official HTTPS endpoint required')
-    return '/v1' if base.endswith('/v1') else ''
+    gateway.validate_endpoint(config.DEEPSEEK_BASE_URL,'openai')
+    return '/v1' if config.DEEPSEEK_BASE_URL.rstrip('/').endswith('/v1') else ''
 
 
 def _deepseek_json(path: str, payload: dict | None = None, timeout: float = 5):
-    prefix = _deepseek_prefix()
-    if path not in {'/models', '/chat/completions'}:
-        raise ValueError('unsupported model operation')
-    # 固定主机、默认证书校验；http.client不会自动跟随重定向，不读取系统代理URL。
-    conn = http.client.HTTPSConnection('api.deepseek.com', timeout=timeout)
-    try:
-        body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode('utf-8')
-        conn.request('GET' if payload is None else 'POST', prefix + path, body=body,
-                     headers={'Content-Type': 'application/json',
-                              'Authorization': 'Bearer ' + config.DEEPSEEK_API_KEY})
-        return _read_json(conn.getresponse())
-    finally:
-        conn.close()
+    settings=gateway.defaults('chat')
+    settings.update(provider='deepseek',protocol='openai',base_url=config.DEEPSEEK_BASE_URL,model=config.DEEPSEEK_MODEL,api_key=config.DEEPSEEK_API_KEY)
+    return gateway._request(settings,path,payload)
 
 
 def status() -> dict:
-    meta = _metadata()
-    if config.LLM_PROVIDER == 'deepseek':
-        if not config.DEEPSEEK_API_KEY or not config.DEEPSEEK_MODEL:
-            return {**meta, 'ready': False, 'message': 'DeepSeek 尚未配置密钥或模型，当前为规则与检索模式。'}
-        try:
-            _deepseek_prefix()
-        except ValueError:
-            return {**meta, 'ready': False, 'message': '模型地址不符合DeepSeek官方HTTPS白名单，已拒绝连接。'}
-        try:
-            models = _deepseek_json('/models').get('data', [])
-            ready = any(model.get('id') == config.DEEPSEEK_MODEL for model in models)
-            return {**meta, 'ready': ready, 'message': 'DeepSeek 模型可用。' if ready else 'DeepSeek未列出配置的模型，未自动切换模型。'}
-        except ModelServiceError as exc:
-            return {**meta, 'ready': False, 'message': exc.safe_message}
-        except Exception:
-            return {**meta, 'ready': False, 'message': 'DeepSeek连接超时或状态响应无效，当前为规则与检索模式。'}
-    if config.LLM_PROVIDER != 'ollama':
-        return {**meta, 'ready': False, 'message': '模型供应商配置无效，当前为规则与检索模式。'}
-    model = config.OLLAMA_MODEL
-    if not model or 'cloud' in model.lower():
-        return {**meta, 'ready': False, 'message': '本地大模型未配置；当前为规则与检索模式。'}
-    try:
-        models = _local_json('/api/tags').get('models', [])
-        ready = any(m.get('name') == model and not m.get('remote_host') and not m.get('remote_model') for m in models)
-        return {**meta, 'ready': ready, 'message': '本地大模型可用' if ready else 'Ollama中没有配置的本地模型。'}
-    except Exception:
-        return {**meta, 'ready': False, 'message': '本机Ollama未启动或不可用；当前为规则与检索模式。'}
+    meta=_metadata();state=gateway.status()
+    return {**meta,'ready':state['ready'],'configuration_only':True,'connected':None,'message':state['message']}
 
 
 def _safe_text(value: str) -> str:
     value = redact(value)
-    if config.DEEPSEEK_API_KEY:
-        value = value.replace(config.DEEPSEEK_API_KEY, '***')
+    for key in {config.DEEPSEEK_API_KEY, *(gateway.get_settings(kind,True).get('api_key','') for kind in gateway.KINDS)}:
+        if key: value=value.replace(key,'***')
     return re.sub(r'\bsk-[A-Za-z0-9_-]{12,}\b', '***', value)
 
 
@@ -132,8 +93,8 @@ def _safe_evidence(value):
         private_keys = {'resume_evidence', 'jd_evidence', 'unknown', 'unknown_requirements',
                         'raw_text', 'raw_resume', 'raw_jd', 'original_text', 'original_file', 'api_key', 'secret'}
         result = {key: _safe_evidence(item) for key, item in value.items()
-                  if not (config.LLM_PROVIDER == 'deepseek' and key in private_keys)}
-        if config.LLM_PROVIDER == 'deepseek':
+                  if not (_metadata()['remote'] and key in private_keys)}
+        if _metadata()['remote']:
             unknown = value.get('unknown', value.get('unknown_requirements'))
             if isinstance(unknown, list):
                 result['unknown_requirement_count'] = len(unknown)
@@ -168,11 +129,15 @@ def explain(task: str, text: str, evidence: dict) -> dict:
                   '只返回中文JSON，不要Markdown或其他字段。summary不超过250字，suggestions最多4项，每项不超过150字。'
                   'JSON格式示例：' + json.dumps(example, ensure_ascii=False))
         prompt_data = {'task': task, 'evidence': safe_evidence}
-        if config.LLM_PROVIDER == 'ollama':
+        if not meta['remote']:
             prompt_data['untrusted_material'] = _safe_text(text)[:6000]
         # 云端只发送脱敏结构化证据，无原始图片/PDF或完整简历/招聘原文。
         prompt = json.dumps(prompt_data, ensure_ascii=False)
-        if config.LLM_PROVIDER == 'deepseek':
+        if gateway.is_custom_chat():
+            reply=gateway.chat([{'role':'user','content':prompt}],system=system,temperature=0.1,max_tokens=1800,purpose='explain')
+            if reply['tool_calls'] or reply['stop_reason'] not in ('stop','end_turn'): raise ValueError('incomplete output')
+            raw=reply['text']
+        elif config.LLM_PROVIDER == 'deepseek':
             result = _deepseek_json('/chat/completions', {
                 'model': config.DEEPSEEK_MODEL,
                 'messages': [{'role': 'system', 'content': system}, {'role': 'user', 'content': prompt}],

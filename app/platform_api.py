@@ -193,15 +193,19 @@ class Job(Input):
 async def jobs(request:Request):
     authorize(request)
     with connect() as db:
-        rows=db.execute('''SELECT j.*,u.username AS publisher,COUNT(r.id) AS review_count,ROUND(AVG(r.rating),1) AS rating
+        rows=db.execute('''SELECT j.*,u.username AS publisher,COUNT(r.id) AS review_count,ROUND(AVG(r.rating),1) AS rating,
+         l.company_id,CASE WHEN c.status='approved' THEN 1 ELSE 0 END AS company_verified
          FROM jobs j JOIN users u ON u.id=j.owner_id LEFT JOIN reviews r ON r.job_id=j.id AND r.hidden=0
-         WHERE j.active=1 AND j.status='approved' GROUP BY j.id ORDER BY j.recommended DESC,j.id DESC LIMIT 200''').fetchall()
+         LEFT JOIN job_company_links l ON l.job_id=j.id LEFT JOIN companies c ON c.id=l.company_id
+         WHERE j.active=1 AND j.status='approved' AND (l.company_id IS NULL OR c.status='approved')
+         GROUP BY j.id ORDER BY j.recommended DESC,j.id DESC LIMIT 200''').fetchall()
     return {'items':[dict(r) for r in rows]}
 
 
 @router.post('/jobs')
 async def add_job(request:Request):
     user=current(request)
+    if user['role']=='company':raise HTTPException(403,'请在企业工作台发布本公司岗位。')
     data=await payload(request,Job)
     if data.recommended and user['role']!='admin': raise HTTPException(403,'推荐岗位仅由管理员发布。')
     fields=[growth.validate_input(x) for x in (data.title,data.company,data.description)]
@@ -223,12 +227,14 @@ async def my_jobs(request:Request):
 @router.put('/jobs/{jid}')
 async def edit_job(jid:int,request:Request):
     user=current(request)
+    if user['role']=='company':raise HTTPException(403,'请在企业工作台修改本公司岗位。')
     data=await payload(request,Job)
     if data.recommended and user['role']!='admin':raise HTTPException(403,'推荐岗位仅由管理员发布。')
     fields=[growth.validate_input(x) for x in (data.title,data.company,data.description)]
     with connect() as db:
         job=db.execute('SELECT * FROM jobs WHERE id=? AND active=1',(jid,)).fetchone()
         if not job:raise HTTPException(404,'岗位不存在。')
+        if db.execute('SELECT 1 FROM job_company_links WHERE job_id=?',(jid,)).fetchone():raise HTTPException(403,'企业岗位请使用企业工作台管理。')
         if job['owner_id']!=user['id']:raise HTTPException(403,'不能修改他人岗位。')
         status='approved' if user['role']=='admin' else 'pending'
         db.execute("UPDATE jobs SET title=?,company=?,description=?,recommended=?,status=?,review_note='',reviewed_by=NULL,reviewed_at=NULL WHERE id=?",(*fields,int(data.recommended),status,jid))
@@ -257,6 +263,8 @@ async def moderate_job(jid:int,request:Request):
     if data.status=='rejected' and not note:raise HTTPException(422,'请填写审核未通过的原因。')
     with connect() as db:
         if not db.execute("SELECT 1 FROM jobs WHERE id=? AND active=1",(jid,)).fetchone():raise HTTPException(404,'岗位不存在。')
+        linked=db.execute('SELECT c.status FROM job_company_links l JOIN companies c ON c.id=l.company_id WHERE l.job_id=?',(jid,)).fetchone()
+        if data.status=='approved' and linked and linked['status']!='approved':raise HTTPException(409,'企业资料审核通过后才能公开该岗位。')
         db.execute('UPDATE jobs SET status=?,review_note=?,reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP WHERE id=?',(data.status,note,user['id'],jid))
         event(db,user['id'],'job_'+data.status)
     return {'ok':True,'status':data.status}
@@ -269,6 +277,7 @@ async def delete_job(jid:int, request:Request):
         job=db.execute('SELECT owner_id FROM jobs WHERE id=?',(jid,)).fetchone()
         if not job: raise HTTPException(404,'岗位不存在。')
         if user['role']!='admin' and job['owner_id']!=user['id']: raise HTTPException(403,'不能下架他人岗位。')
+        if user['role']!='admin' and db.execute('SELECT 1 FROM job_company_links WHERE job_id=?',(jid,)).fetchone():raise HTTPException(403,'企业岗位请使用企业工作台管理。')
         db.execute('UPDATE jobs SET active=0 WHERE id=?',(jid,))
         event(db,user['id'],'job_remove')
     return {'ok':True}
@@ -482,7 +491,7 @@ async def erase_learning(request:Request):
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
         db.execute('UPDATE users SET data_generation=data_generation+1 WHERE id=?',(user['id'],))
-        for table in ('exams','wrongbook','interviews','trees','profiles','materials','career_reports'):
+        for table in ('assistant_threads','resume_sessions','exams','wrongbook','interviews','trees','profiles','materials','career_reports'):
             db.execute(f'DELETE FROM {table} WHERE user_id=?',(user['id'],))
         event(db,user['id'],'learning_erase')
     return {'ok':True}

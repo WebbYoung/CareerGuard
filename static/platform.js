@@ -46,9 +46,13 @@ function resetPlatform(){
   $('#tree-workspace').hidden=true;$('#exam-submit').hidden=true;$('#tree-saved').replaceChildren(new Option('选择个人路线',''));
   document.querySelectorAll('dialog[open]').forEach(d=>d.close());
 }
+let profileLoadEpoch=0,profileWipeEpoch=0;
+window.addEventListener('account-data-erased',()=>{profileLoadEpoch++;profileWipeEpoch++;});
 async function loadProfile(){
+  const profileEpoch=++profileLoadEpoch;
   if(!platform.user)return;
   const [p,wrong,history,exams,materials,reports]=await Promise.all([api('/profile'),api('/learning/wrongbook'),api('/interviews'),api('/learning/exams'),api('/profile/materials'),api('/career/reports')]);
+  if(profileEpoch!==profileLoadEpoch)return;
   $('#profile-occupation').value=p.occupation;$('#profile-resume').value=p.resume;
   if(!$('#tree-occupation').value)$('#tree-occupation').value=p.occupation;
   if(!$('#interview-occupation').value)$('#interview-occupation').value=p.occupation;
@@ -188,7 +192,7 @@ const platformHandlers={logout,'save-profile':saveProfile,'use-profile':useProfi
   'refresh-profile':async()=>{signed();await loadProfile();},'generate-tree':generateTree,'load-trees':loadTrees,
   'submit-exam':submitExam,practice,'load-jobs':loadJobs,'publish-job':publishJob,'save-review':saveReview,
   'start-interview':startInterview,'send-answer':sendAnswer,'end-interview':endInterview,listen,interrupt:()=>{stopVoice();text('#voice-status','已停止听写与朗读，文字仍可编辑。');},
-  'erase-learning':async()=>{signed();if(!confirm('删除当前账号的材料、档案、职业报告、技能树、考试、错题与面试记录？此操作不可恢复，已发布岗位和点评保留。'))return;stopVoice();platform.interviewEpoch++;await api('/profile/data',{method:'DELETE'});resetPlatform();await loadProfile();toast('个人档案和学习记录已删除。');}
+  'erase-learning':async()=>{signed();if(!confirm('删除当前账号的材料、档案、职业报告、技能树、考试、错题与面试记录？此操作不可恢复，已发布岗位和点评保留。'))return;stopVoice();platform.interviewEpoch++;await api('/profile/data',{method:'DELETE'});resetPlatform();window.dispatchEvent(new Event('account-data-erased'));await loadProfile();toast('个人档案和学习记录已删除。');}
 };
 
 async function initPlatform(){
@@ -214,7 +218,7 @@ async function initPlatform(){
   $('#interview-consent').addEventListener('change',()=>{if(!$('#interview-consent').checked){stopVoice();platform.interviewEpoch++;}});
   window.addEventListener('career-report',event=>inheritCareer(event.detail.result,event.detail.jd));
   window.addEventListener('platform-clear',()=>{stopVoice();platform.interviewEpoch++;platform.interview=null;platform.skills=[];$('#tree-jd').value='';$('#interview-jd').value='';$('#interview-answer').value='';$('#interview-messages').replaceChildren();text('#career-tree-note','当前会话已清空，已保存学习记录可从个人中心重新打开。');});
-  window.addEventListener('viewchange',event=>{if(event.detail!=='tree')platform.canvas?.cancel();if(event.detail!=='interview'){stopVoice();platform.interviewEpoch++;}const loaders={profile:async()=>{await loadAccount();await loadProfile();},tree:loadTrees,jobs:loadJobs};const load=loaders[event.detail];if(load)load().catch(e=>toast(e.message,true));});
+  window.addEventListener('viewchange',event=>{if(event.detail!=='tree')platform.canvas?.cancel();if(event.detail!=='interview'){stopVoice();platform.interviewEpoch++;}const loaders={profile:async()=>{await loadAccount();await loadProfile();},tree:loadTrees,jobs:loadJobs};const load=loaders[event.detail];if(load&&!(event.detail==='profile'&&window.careerProfileFilling))load().catch(e=>toast(e.message,true));});
   window.addEventListener('pagehide',stopVoice);document.addEventListener('visibilitychange',()=>{if(document.hidden)stopVoice();});
   // 原有会话启动完成后获取账号状态，不重复调用需要模型检查的bootstrap。
   if(!state.csrf)await new Promise(resolve=>{const timer=setInterval(()=>{if(state.csrf){clearInterval(timer);resolve();}},100);setTimeout(()=>{clearInterval(timer);resolve();},8000);});
@@ -223,3 +227,5 @@ async function initPlatform(){
   window.dispatchEvent(new Event('platform-loaded'));
 }
 initPlatform().catch(e=>toast(e.message,true));
+
+window.CareerProfile={async fill(fields){const wipeEpoch=profileWipeEpoch;window.careerProfileFilling=true;try{show('profile');await loadAccount();await loadProfile();if(wipeEpoch!==profileWipeEpoch)return;for(const [key,value] of Object.entries(fields)){if(['occupation','resume'].includes(key)&&typeof value==='string')$('#profile-'+key).value=value;}}finally{window.careerProfileFilling=false;}}};

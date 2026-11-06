@@ -1,4 +1,4 @@
-"""环境变量仅由进程启动读取，不允许用户请求覆盖模型地址或路径。"""
+"""环境变量提供模型初始配置；管理员可保存经端点策略校验的加密配置。"""
 import os
 from pathlib import Path
 from dotenv import load_dotenv

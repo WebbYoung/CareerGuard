@@ -10,7 +10,8 @@
 <link rel="stylesheet" href="/static/cinematic.css"><script src="/static/cinematic.js" defer></script>
 <link rel="stylesheet" href="/static/effects.css"><script src="/static/effects-core.js" defer></script><script src="/static/effects.js" defer></script>
 <link rel="stylesheet" href="/static/guide-assistant.css"><script src="/static/guide-core.js" defer></script><script type="module" src="/static/guide-assistant.js"></script>
-</head>
+<link rel="stylesheet" href="/static/resume-studio.css"><script src="/static/resume-studio.js" defer></script><script src="/static/workspace-expansion.js" defer></script>
+<link rel="stylesheet" href="/static/assistant-chat.css"><script src="/static/assistant-chat.js" defer></script></head>
 <body class="star-theme">
 <svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
 <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6Z"/><path d="m8 12 3 3 5-6"/></symbol>
@@ -38,6 +39,7 @@
     <button class="nav-item" data-view="risk"><svg><use href="#i-alert"/></svg>招聘风险</button>
     <button class="nav-item" data-view="privacy"><svg><use href="#i-lock"/></svg>隐私保护</button>
     <button class="nav-item" data-view="career"><svg><use href="#i-route"/></svg>职业规划</button>
+    <button type="button" class="nav-item" data-view="resume" disabled aria-label="AI 简历生成，正在加载"><svg><use href="#i-spark"/></svg>AI 简历生成</button>
       </nav>
   <div class="sidebar-bottom"><div class="sidebar-footer"><span class="avatar">我</span><span>我的账号<small>正在加载资料</small></span><span class="online-dot"></span></div></div>
 </aside>
@@ -77,6 +79,6 @@
   </main>
 </div>
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
-<dialog id="help-dialog"><div class="dialog-header"><button class="icon-button" data-action="close-dialog" aria-label="关闭说明">×</button></div><h2>开始你的求职准备</h2><ol><li>添加招聘截图，运行 OCR 与招聘风险研判。</li><li>添加简历图片或 PDF，检测敏感信息。</li><li>核对脱敏前后，导出脱敏文字。</li><li>粘贴岗位 JD，生成证据差距与四周计划。</li></ol><p>OCR 提取材料文字，AI 根据证据提供解读；使用 DeepSeek 时仅发送脱敏结构化证据，不上传原始文件或完整简历。未配置模型时会明确显示降级原因。</p><button class="button primary" data-action="close-dialog">开始体验</button></dialog>
+<dialog id="help-dialog"><div class="dialog-header"><button class="icon-button" data-action="close-dialog" aria-label="关闭说明">×</button></div><h2>开始你的求职准备</h2><ol><li>添加招聘截图，运行 OCR 与招聘风险研判。</li><li>添加简历图片或 PDF，检测敏感信息。</li><li>核对脱敏前后，导出脱敏文字。</li><li>粘贴岗位 JD，生成证据差距与四周计划。</li></ol><p>OCR 提取材料文字，AI 根据证据提供解读；风险分析发送脱敏证据；简历、对话与证件照会在相应功能说明发送范围，并需用户勾选授权。未配置模型时会明确提示。</p><button class="button primary" data-action="close-dialog">开始体验</button></dialog>
 
 </body></html>

@@ -2,7 +2,8 @@
 import json
 import pytest
 from app import config
-from app.services import llm
+from app.services import llm, model_gateway as gateway
+import socket
 
 
 @pytest.fixture
@@ -25,7 +26,8 @@ def install_transport(monkeypatch, handler):
             return json.dumps(self.data,ensure_ascii=False).encode('utf-8')[:maximum]
         def close(self):
             pass
-    monkeypatch.setattr(llm.http.client,'HTTPSConnection',Connection)
+    monkeypatch.setattr(gateway,'PinnedHTTPSConnection',Connection)
+    monkeypatch.setattr(socket,'getaddrinfo',lambda *a,**k:[(socket.AF_INET,socket.SOCK_STREAM,6,'',('8.8.8.8',443))])
 
 
 def completion(content):
@@ -39,19 +41,19 @@ def valid_content():
             'suggestions':[{'text':'请核验收费依据与书面条款。','evidence_ids':['R1']}]}
 
 
-def test_cloud_status_checks_requested_model_without_exposing_key(cloud,monkeypatch):
-    def handler(method,path,payload,headers):
-        assert method=='GET' and path=='/models'
-        assert headers['Authorization']=='Bearer test-credential-not-real'
-        return 200,{'object':'list','data':[{'id':'deepseek-flash','object':'model','owned_by':'deepseek'}]}
-    install_transport(monkeypatch,handler)
+def test_cloud_status_is_configuration_only_without_exposing_key(cloud,monkeypatch):
+    def forbidden(*args,**kwargs):
+        pytest.fail('配置状态不能探测模型或解析DNS')
+    monkeypatch.setattr(gateway,'_request',forbidden)
+    monkeypatch.setattr(socket,'getaddrinfo',forbidden)
     result=llm.status()
     assert result['ready'] and result['provider']=='deepseek'
+    assert result['configuration_only'] and result['connected'] is None
     assert 'test-credential-not-real' not in json.dumps(result)
 
 
 @pytest.mark.parametrize('base',['http://api.deepseek.com','https://127.0.0.1','https://api.deepseek.com@foreign.invalid',
-                               'https://api.deepseek.com.foreign.invalid','https://api.deepseek.com/search','https://api.deepseek.com:444'])
+                               'https://api.deepseek.com.foreign.invalid','https://api.deepseek.com/search?query=forbidden','https://api.deepseek.com:444'])
 def test_cloud_arbitrary_base_url_rejected_without_network(cloud,monkeypatch,base):
     monkeypatch.setattr(config,'DEEPSEEK_BASE_URL',base)
     def forbidden(*args,**kwargs):
@@ -155,8 +157,12 @@ def test_cloud_incomplete_tool_and_oversized_outputs_rejected(cloud,monkeypatch,
 
 def test_cloud_official_v1_prefix_uses_same_fixed_host(cloud,monkeypatch):
     monkeypatch.setattr(config,'DEEPSEEK_BASE_URL','https://api.deepseek.com/v1/')
+    calls=[]
     def handler(method,path,payload,headers):
-        assert path=='/v1/models'
-        return 200,{'data':[{'id':'deepseek-flash'}]}
+        calls.append(path)
+        assert path=='/v1/chat/completions'
+        return 200,completion(valid_content())
     install_transport(monkeypatch,handler)
-    assert llm.status()['ready']
+    assert llm.status()['ready'] and not calls
+    assert llm.explain('风险','押金',{'R1':{'quote':'押金'}})['used']
+    assert calls==['/v1/chat/completions']

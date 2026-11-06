@@ -60,9 +60,9 @@ async function bootstrap() {
   const data=await api('/session');state.csrf=data.csrf_token;
   const ocr=data.models.ocr.configured, model=data.models.llm, llm=model.ready;
   $('#ocr-status').className='badge '+(ocr?'green':'neutral');text('#ocr-status',ocr?'路径已配置':'待配置模型');
-  $('#llm-status').className='badge '+(llm?'green':'neutral');text('#llm-status',llm?'可用':'规则模式');
+  $('#llm-status').className='badge '+(llm?'green':'neutral');text('#llm-status',llm?'已配置 · 待验证':'规则模式');
   $('#llm-status').title=model.message;
-  text('#llm-name',model.remote?'DeepSeek':'大语言模型');
+  text('#llm-name',model.provider||'大语言模型');
   text('#llm-description',model.model||'基于证据的解释与建议');
   text('#model-deployment','OCR + AI');
   document.querySelectorAll('.model-policy').forEach(el=>{el.textContent=model.data_policy||'模型状态如实展示，结果仍需人工核验。';});

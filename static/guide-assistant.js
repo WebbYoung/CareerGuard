@@ -7,7 +7,7 @@ if(core){
   const make=(tag,cls,text='')=>{const e=document.createElement(tag);e.className=cls;e.textContent=text;return e;};
   const assistant=make('div','robot-assistant'),modelHost=make('div','robot-model');
   const launcher=make('button','robot-launcher');launcher.type='button';launcher.disabled=true;launcher.setAttribute('aria-label','让小安带我了解职安');launcher.title='重新查看新手引导';
-  const name=make('span','robot-name','小安 · 点击引导');assistant.append(modelHost,launcher,name);document.body.append(assistant);
+  const name=make('span','robot-name','小安 · 和我聊聊');assistant.append(modelHost,launcher,name);document.body.append(assistant);
   const model=createGuideRobot(modelHost,{reducedMotion:reduced.matches});
   const overlay=make('div','robot-tour-backdrop'),highlight=make('div','robot-tour-highlight'),bubble=make('section','robot-bubble');
   overlay.hidden=highlight.hidden=bubble.hidden=true;
@@ -16,7 +16,7 @@ if(core){
   title.id='robot-guide-title';description.id='robot-guide-body';message.setAttribute('role','status');message.setAttribute('aria-live','polite');
   const controls=make('div','robot-guide-controls'),previous=make('button','robot-guide-prev','上一步'),skip=make('button','robot-guide-skip','跳过引导'),next=make('button','robot-guide-next','我明白了');
   [previous,skip,next].forEach(b=>b.type='button');controls.append(previous,skip,next);bubble.append(progress,title,description,message,controls);document.body.append(overlay,highlight,bubble);
-  let active=false,index=0,busy=false,initialized=false,oldOverflow='',oldFocus=null,target=null,frame=0,aim=null;
+  let active=false,index=0,busy=false,initialized=false,oldOverflow='',oldFocus=null,target=null,frame=0,aim=null,contextual=false;
   const gate=core.createGate();
   const inerted=new Map();
   const request=(data,keepalive=false)=>window.api('/onboarding',data?{method:'POST',data,keepalive}:{});
@@ -54,7 +54,7 @@ if(core){
     const step=core.STEPS[index];if(!step)return;
     window.show(step.view);
     target=document.querySelector(step.target)||document.querySelector('#view-'+step.view+' .page-heading');
-    progress.textContent=`小安的使用指南 · ${index+1} / ${core.STEPS.length}`;title.textContent=step.title;description.textContent=step.body;message.textContent='';previous.hidden=index===0;
+    progress.textContent=contextual?'小安 · 操作说明':`小安的使用指南 · ${index+1} / ${core.STEPS.length}`;title.textContent=step.title;description.textContent=step.body;message.textContent='';previous.hidden=contextual||index===0;
     if(target){target.scrollIntoView({block:innerWidth<700?'start':'center',behavior:'instant'});position();}
     else {message.textContent='这个区域暂未就绪，可以跳过这一步。';target=document.querySelector('#main');position();}
     next.focus({preventScroll:true});schedule();
@@ -78,6 +78,7 @@ if(core){
   }
   async function begin(){
     if(active||launcher.disabled)return;
+    contextual=false;
     const token=gate.begin();
     launcher.disabled=true;
     try{const result=await request({action:'start',step:0});open(result.step,token);}
@@ -86,6 +87,7 @@ if(core){
   }
   async function advance(direction){
     if(busy||!active)return;
+    if(contextual){close();contextual=false;return;}
     const token=gate.version,wanted=index+direction,done=wanted>=core.STEPS.length;setBusy(true);message.textContent='';
     try{
       await request({action:done?'complete':'progress',step:done?index:wanted});
@@ -96,12 +98,15 @@ if(core){
   }
   async function skipGuide(){
     if(!active)return;
+    if(contextual){close();contextual=false;return;}
     const step=index;close();launcher.disabled=true;
     try{await request({action:'skip',step},true);}
     catch{if(typeof window.toast==='function')window.toast('引导已关闭，进度暂未保存。',true);}
     finally{launcher.disabled=false;}
   }
-  launcher.addEventListener('click',begin);previous.addEventListener('click',()=>advance(-1));next.addEventListener('click',()=>advance(1));skip.addEventListener('click',skipGuide);
+  window.CareerGuide={start:begin,explain(view){const i=core.STEPS.findIndex(s=>s.view===view);if(active)return;if(i<0){if(view==='resume')window.show('resume');return;}contextual=true;open(i,gate.begin());}};
+  launcher.title='与小安对话';launcher.setAttribute('aria-label','与小安对话');
+  launcher.addEventListener('click',()=>window.CareerAssistant?window.CareerAssistant.open():begin());previous.addEventListener('click',()=>advance(-1));next.addEventListener('click',()=>advance(1));skip.addEventListener('click',skipGuide);
   document.addEventListener('keydown',e=>{
     if(!active)return;
     if(e.key==='Escape'){e.preventDefault();skipGuide();}

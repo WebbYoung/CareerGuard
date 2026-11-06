@@ -4,7 +4,7 @@ import re
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 from fastapi import HTTPException
 from .. import config
-from . import llm
+from . import llm, model_gateway as gateway
 from .security import inspect_injection
 
 
@@ -107,7 +107,7 @@ def validate_input(value):
 
 
 def generate_json(task: str, data: dict, schema):
-    """固定官方服务，不接收请求中的任意URL。无工具、链接访问或网页抓取。"""
+    """使用管理员配置的受限模型网关。无工具、链接访问或网页抓取。"""
     safe = llm._safe_evidence(data)
     encoded = json.dumps(safe, ensure_ascii=False)
     validate_input(encoded)
@@ -117,7 +117,11 @@ def generate_json(task: str, data: dict, schema):
               '只生成中文JSON，严格遵循schema，不增加字段。不保证掌握或录用，不声称经历已核实。'
               +task+' JSON schema:'+json.dumps(schema.model_json_schema(),ensure_ascii=False))
     try:
-        if config.LLM_PROVIDER == 'deepseek':
+        if gateway.is_custom_chat():
+            reply=gateway.chat([{'role':'user','content':encoded}],system=system,temperature=.35,max_tokens=10000 if schema is Tree else 6000,purpose='growth')
+            if reply['tool_calls'] or reply['stop_reason'] not in ('stop','end_turn'): raise ValueError('incomplete')
+            raw=reply['text']
+        elif config.LLM_PROVIDER == 'deepseek':
             if not config.DEEPSEEK_API_KEY:
                 raise HTTPException(503,'请先由管理员配置大模型密钥。')
             reply = llm._deepseek_json('/chat/completions', {
