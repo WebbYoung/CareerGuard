@@ -165,9 +165,13 @@ def _calls(message):
     return result
 
 
-def chat(messages, *, system='', tools=None, temperature=.3, max_tokens=2500, purpose='chat'):
+def chat(messages, *, system='', tools=None, temperature=.3, max_tokens=2500, purpose='chat', response_schema=None):
     s=get_settings('chat',True)
     if not configured(): raise GatewayError('请先由管理员配置大模型。')
+    if response_schema is not None:
+        if tools or not isinstance(response_schema,dict) or response_schema.get('type')!='object':
+            raise GatewayError('结构化输出配置无效。')
+        system+='\n只返回符合以下schema的JSON对象，不要Markdown。JSON schema:'+json.dumps(response_schema,ensure_ascii=False)
     try:
         if s['protocol']=='anthropic':
             converted=[]
@@ -183,7 +187,16 @@ def chat(messages, *, system='', tools=None, temperature=.3, max_tokens=2500, pu
                 else: converted.append(entry)
             p={'model':s['model'],'messages':converted,'system':system,'temperature':temperature,'max_tokens':max_tokens}
             if tools: p['tools']=[{'name':t['function']['name'],'description':t['function'].get('description',''),'input_schema':t['function']['parameters']} for t in tools]
+            if response_schema is not None:
+                # This forced tool is a data envelope only; no business tool is executed.
+                p['tools']=[{'name':'submit_result','description':'Return the required structured JSON result.','input_schema':response_schema}]
+                p['tool_choice']={'type':'tool','name':'submit_result'}
             r=_request(s,'/messages',p)
+            if response_schema is not None:
+                calls=[c for c in r['content'] if c['type']=='tool_use']
+                if r.get('stop_reason')=='max_tokens':return {'text':'','tool_calls':[],'stop_reason':'length'}
+                if r.get('stop_reason')!='tool_use' or len(calls)!=1 or calls[0]['name']!='submit_result' or not isinstance(calls[0]['input'],dict):raise GatewayError()
+                return {'text':json.dumps(calls[0]['input'],ensure_ascii=False),'tool_calls':[],'stop_reason':'end_turn'}
             return {'text':''.join(c.get('text','') for c in r['content'] if c['type']=='text'),'tool_calls':[{'id':c['id'],'name':c['name'],'arguments':c['input']} for c in r['content'] if c['type']=='tool_use'],'stop_reason':r.get('stop_reason','')}
         msgs=([{'role':'system','content':system}] if system else [])+messages
         # Normalized assistant calls can be round-tripped by tool agents.
@@ -199,6 +212,10 @@ def chat(messages, *, system='', tools=None, temperature=.3, max_tokens=2500, pu
         if s['protocol']=='ollama':
             p['options']={'temperature':temperature,'num_predict':max_tokens}
         else: p.update(temperature=temperature,max_tokens=max_tokens)
+        if response_schema is not None:
+            if s['protocol']=='ollama':p['format']=response_schema
+            else:p['response_format']={'type':'json_object'}
+            if urlsplit(s['base_url']).hostname=='api.deepseek.com':p['thinking']={'type':'disabled'}
         if tools:p['tools']=tools
         r=_request(s,'/api/chat' if s['protocol']=='ollama' else '/chat/completions',p)
         choice=r if s['protocol']=='ollama' else r['choices'][0]
