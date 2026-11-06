@@ -38,7 +38,7 @@
     scope.querySelectorAll('.site-brand>img[src="/static/mark.svg"]').forEach(img=>img.replaceWith(newIcon('shield')));
     const glyphSelector='.star-orb,.star-detail-symbol,.star-career-item>span:first-child,.model-logo,.camera-tool-icon,.camera-placeholder>span,.voice-orb,.avatar,.top-avatar,.icon-button:not([data-action=close-dialog])';
     [...(scope.matches?.(glyphSelector)?[scope]:[]),...scope.querySelectorAll(glyphSelector)].forEach(el=>{
-      if(el.dataset.fxIcon)return;
+      if(el.dataset.fxIcon||el.classList.contains('account-nav-avatar'))return;
       let name='spark';
       const glyphName={'⌘':'grid','⬡':'tree','▥':'list','✦':'spark','◇':'shield','☁':'upload','✓':'check','▯':'file','⌁':'route'}[el.textContent.trim()];
       const node=el.closest('.star-node');

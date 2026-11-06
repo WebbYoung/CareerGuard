@@ -17,6 +17,7 @@ from .resume_api import router as resume_router
 from .company_api import router as company_router
 from .services import model_gateway
 from .assistant_api import router as assistant_router
+from .account_api import router as account_router
 from .services import vision
 
 
@@ -92,6 +93,7 @@ app.include_router(model_router)
 app.include_router(resume_router)
 app.include_router(company_router)
 app.include_router(assistant_router)
+app.include_router(account_router)
 app.mount('/static', StaticFiles(directory=ROOT/'static'), name='static')
 
 

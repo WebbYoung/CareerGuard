@@ -491,7 +491,7 @@ async def erase_learning(request:Request):
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
         db.execute('UPDATE users SET data_generation=data_generation+1 WHERE id=?',(user['id'],))
-        for table in ('assistant_threads','resume_sessions','exams','wrongbook','interviews','trees','profiles','materials','career_reports'):
+        for table in ('account_details','assistant_threads','resume_sessions','exams','wrongbook','interviews','trees','profiles','materials','career_reports'):
             db.execute(f'DELETE FROM {table} WHERE user_id=?',(user['id'],))
         event(db,user['id'],'learning_erase')
     return {'ok':True}
