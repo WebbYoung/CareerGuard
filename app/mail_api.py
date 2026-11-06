@@ -177,5 +177,3 @@ async def save_config(request:Request):
         if bool(old and old.get('enabled'))!=conf['enabled']:
             event(db,u['id'],'mail_smtp_enabled' if conf['enabled'] else 'mail_smtp_disabled')
     return {'saved':True,'enabled':conf['enabled'],'notice':'配置已保存，未连接或测试SMTP。'}
-
-

@@ -130,4 +130,3 @@ async def candidate(aid:int,request:Request,response:Response):
 def clear_user_applications(db,uid):
     """Call in personal-data deletion transaction; revoke access and erase snapshots."""
     db.execute("UPDATE job_applications SET status='withdrawn',share_resume=0,interview_consent=0,resume_encrypted=NULL,updated=CURRENT_TIMESTAMP WHERE user_id=?",(uid,))
-

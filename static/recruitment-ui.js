@@ -7,4 +7,3 @@ async function open(job){if(!job.company_id){window.dispatchEvent(new CustomEven
 async function mine(){const d=modal('我的投递');try{const result=await api('/applications');if(!result.items.length)d.append(node('p','尚未主动投递岗位。'));for(const item of result.items){const card=node('article');card.append(node('h3',item.title),node('p',item.company+' · '+(item.status==='active'?'已授权':'已撤回')));if(item.status==='active'){const withdraw=node('button','撤回授权');withdraw.onclick=async()=>{withdraw.disabled=true;try{await api('/applications/'+item.id,'DELETE');d.close();mine();}catch(e){withdraw.disabled=false;card.append(node('p',e.message));}};card.append(withdraw);}d.append(card);}}catch(e){d.append(node('p',e.message));}}
 window.RecruitmentUI={open,mine};
 })();
-
