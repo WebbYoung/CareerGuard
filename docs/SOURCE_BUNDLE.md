@@ -378,6 +378,9 @@ from .resume_api import router as resume_router
 from .company_api import router as company_router
 from .services import model_gateway
 from .assistant_api import router as assistant_router
+from .account_api import router as account_router
+from .recruitment_api import router as recruitment_router
+from .mail_api import router as mail_router
 from .services import vision
 
 
@@ -453,6 +456,9 @@ app.include_router(model_router)
 app.include_router(resume_router)
 app.include_router(company_router)
 app.include_router(assistant_router)
+app.include_router(account_router)
+app.include_router(recruitment_router)
+app.include_router(mail_router)
 app.mount('/static', StaticFiles(directory=ROOT/'static'), name='static')
 
 
@@ -467,6 +473,11 @@ async def company_register_page():
 
 
 @app.get('/company')
+@app.get('/company/overview')
+@app.get('/company/jobs')
+@app.get('/company/publish')
+@app.get('/company/candidates')
+@app.get('/company/mail')
 async def company_console_page(request:Request):
     from .platform_api import identity
     from fastapi import HTTPException
@@ -832,6 +843,8 @@ from .services.model_schema import SCHEMA as MODEL_SCHEMA
 from .services.resume_schema import SCHEMA as RESUME_SCHEMA
 from .services.company_schema import SCHEMA as COMPANY_SCHEMA
 from .services.assistant_schema import SCHEMA as ASSISTANT_SCHEMA
+from .services.recruitment_schema import SCHEMA as RECRUITMENT_SCHEMA
+from .services.mail_schema import SCHEMA as MAIL_SCHEMA
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -842,6 +855,8 @@ CREATE TABLE IF NOT EXISTS user_guides(user_id INTEGER NOT NULL REFERENCES users
  guide_id TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',step INTEGER NOT NULL DEFAULT 0,
  updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(user_id,guide_id));
 CREATE TABLE IF NOT EXISTS profiles(user_id INTEGER PRIMARY KEY REFERENCES users(id), occupation TEXT NOT NULL DEFAULT '', resume TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS account_details(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ nickname TEXT NOT NULL DEFAULT '',city TEXT NOT NULL DEFAULT '',bio TEXT NOT NULL DEFAULT '',avatar BLOB,avatar_revision INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES users(id), title TEXT NOT NULL,
  company TEXT NOT NULL, description TEXT NOT NULL, recommended INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS reviews(id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL REFERENCES jobs(id), user_id INTEGER NOT NULL REFERENCES users(id),
@@ -862,7 +877,7 @@ CREATE TABLE IF NOT EXISTS analyses(user_id INTEGER NOT NULL REFERENCES users(id
 '''
 
 
-SCHEMA += MODEL_SCHEMA + RESUME_SCHEMA + COMPANY_SCHEMA + ASSISTANT_SCHEMA
+SCHEMA += MODEL_SCHEMA + RESUME_SCHEMA + COMPANY_SCHEMA + ASSISTANT_SCHEMA + RECRUITMENT_SCHEMA + MAIL_SCHEMA
 
 
 @contextmanager
@@ -1450,7 +1465,10 @@ async def erase_learning(request:Request):
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
         db.execute('UPDATE users SET data_generation=data_generation+1 WHERE id=?',(user['id'],))
-        for table in ('assistant_threads','resume_sessions','exams','wrongbook','interviews','trees','profiles','materials','career_reports'):
+        from .recruitment_api import clear_user_applications
+        clear_user_applications(db,user['id'])
+        db.execute('DELETE FROM mail_addresses WHERE user_id=?',(user['id'],))
+        for table in ('account_details','assistant_threads','resume_sessions','exams','wrongbook','interviews','trees','profiles','materials','career_reports'):
             db.execute(f'DELETE FROM {table} WHERE user_id=?',(user['id'],))
         event(db,user['id'],'learning_erase')
     return {'ok':True}
@@ -1487,9 +1505,10 @@ async def practice(request:Request):
 
 
 class InterviewInput(Input):
-    occupation: str = Field(min_length=1,max_length=100)
-    jd: str = Field(default='',max_length=6000)
+    occupation: str = Field(min_length=1,max_length=160)
+    jd: str = Field(default='',max_length=12000)
     consent: bool = False
+    application_id: int | None = Field(default=None,gt=0)
 
 
 class Turn(Input):
@@ -1501,6 +1520,12 @@ class Turn(Input):
 async def interview_start(request:Request):
     user=current(request);data=await payload(request,InterviewInput);consent(data)
     occupation=growth.validate_input(data.occupation);jd=growth.validate_input(data.jd)
+    if data.application_id is not None:
+        from .recruitment_api import validate_application
+        with connect() as db:
+            application=validate_application(db,user,data.application_id,occupation)
+        # Linked interviews use the authorized job snapshot, never a substituted client JD.
+        jd=application['jd']
     reply=await compute(growth.generate_json,'扮演模拟面试官。根据岗位提出第一道具体问题，简短自然，每轮只问一道。feedback首轮为空，focus为考查技能。',{'occupation':occupation,'jd':jd},growth.InterviewReply)
     reply=growth.InterviewReply.model_validate(reply).model_dump()
     history=[{'role':'assistant','content':reply['question'],'feedback':reply['feedback'],'focus':reply['focus']}]
@@ -1508,6 +1533,9 @@ async def interview_start(request:Request):
     with connect() as db:
         write_guard(db,user)
         iid=db.execute('INSERT INTO interviews(user_id,occupation,history) VALUES (?,?,?)',(user['id'],occupation,encode(history))).lastrowid
+        if data.application_id is not None:
+            from .recruitment_api import attach_interview
+            attach_interview(db,user,data.application_id,iid,occupation)
         event(db,user['id'],'interview_start')
     return {'id':iid,**reply,'history':history}
 
@@ -1550,7 +1578,8 @@ async def end_interview(iid:int,request:Request):
 async def overview(request:Request):
     current(request,True)
     with connect() as db:
-        totals={table:db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] for table in ('users','jobs','reviews','trees','exams','interviews')}
+        totals={table:db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] for table in ('users','companies','jobs','reviews','trees','exams','interviews','mail_messages')}
+        totals['active_applications']=db.execute("SELECT COUNT(*) FROM job_applications WHERE status='active' AND share_resume=1").fetchone()[0]
         activity=[dict(r) for r in db.execute('SELECT action,COUNT(*) AS count FROM events GROUP BY action ORDER BY count DESC')]
         daily=[dict(r) for r in db.execute('SELECT date(created) AS day,COUNT(*) AS count FROM events GROUP BY day ORDER BY day DESC LIMIT 14')]
         totals['active_users_today']=db.execute("SELECT COUNT(DISTINCT user_id) FROM events WHERE date(created)=date('now')").fetchone()[0]
@@ -3967,6 +3996,571 @@ CREATE INDEX IF NOT EXISTS resume_owner ON resume_sessions(user_id,updated);
 '''
 ```
 
+### `app/account_api.py`
+
+```python
+"""Editable account presentation; uploads are decoded in memory and metadata stripped."""
+import io
+import warnings
+from fastapi import APIRouter,Request,Response,HTTPException
+from pydantic import Field
+from PIL import Image,ImageOps,UnidentifiedImageError
+from .api import Input,payload,read_bytes,compute
+from .database import connect,cipher,event
+from .platform_api import current,write_guard
+
+router=APIRouter(prefix='/api/account')
+
+class Details(Input):
+    nickname:str=Field(default='',max_length=24)
+    city:str=Field(default='',max_length=40)
+    bio:str=Field(default='',max_length=160)
+
+def presentation(user,row):
+    return {'username':user['username'],'role':user['role'],'created':user['created'],
+            'nickname':row['nickname'] if row else '', 'city':row['city'] if row else '',
+            'bio':row['bio'] if row else '', 'has_avatar':bool(row and row['avatar']),
+            'avatar_revision':row['avatar_revision'] if row else 0}
+
+def account(db,user):
+    return presentation(user,db.execute('SELECT * FROM account_details WHERE user_id=?',(user['id'],)).fetchone())
+
+@router.get('')
+async def get_account(request:Request):
+    user=current(request)
+    with connect() as db:return account(db,user)
+
+@router.put('')
+async def save_account(request:Request):
+    user=current(request);data=await payload(request,Details)
+    values={k:v.strip() for k,v in data.model_dump().items()}
+    for key,value in values.items():
+        if any(ord(c)<32 and not (key=='bio' and c in '\n\t') for c in value):raise HTTPException(422,'资料包含无效控制字符。')
+    with connect() as db:
+        write_guard(db,user)
+        db.execute('''INSERT INTO account_details(user_id,nickname,city,bio) VALUES (?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET nickname=excluded.nickname,city=excluded.city,bio=excluded.bio''',
+            (user['id'],values['nickname'],values['city'],values['bio']))
+        event(db,user['id'],'account_profile_save')
+        return account(db,user)
+
+def normalize_avatar(raw,kind):
+    formats={'image/jpeg':'JPEG','image/png':'PNG','image/webp':'WEBP'}
+    if kind not in formats:raise HTTPException(415,'头像支持PNG、JPEG或WebP静态图片。')
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('error',Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw)) as source:
+                if source.format!=formats[kind]:raise HTTPException(415,'图片格式与声明不一致。')
+                if source.width*source.height>16000000:raise HTTPException(413,'头像像素不可超过1600万。')
+                if getattr(source,'n_frames',1)!=1:raise HTTPException(422,'请使用静态图片作为头像。')
+                source.load()
+                oriented=ImageOps.exif_transpose(source)
+                cropped=ImageOps.fit(oriented.convert('RGBA'),(256,256),method=Image.Resampling.LANCZOS)
+                # A fresh image strips EXIF, ICC and arbitrary text chunks from the upload.
+                clean=Image.new('RGBA',(256,256));clean.paste(cropped)
+                output=io.BytesIO();clean.save(output,format='PNG');return output.getvalue()
+    except (UnidentifiedImageError,OSError,ValueError,Image.DecompressionBombError,Image.DecompressionBombWarning):
+        raise HTTPException(422,'图片无法解码，请选择有效的静态图片。') from None
+
+@router.post('/avatar')
+async def upload_avatar(request:Request):
+    user=current(request)
+    raw=await read_bytes(request,4*1024*1024)
+    kind=request.headers.get('content-type','').split(';',1)[0].strip().lower()
+    clean=await compute(normalize_avatar,raw,kind)
+    with connect() as db:
+        write_guard(db,user)
+        db.execute('''INSERT INTO account_details(user_id,avatar,avatar_revision) VALUES (?,?,1)
+            ON CONFLICT(user_id) DO UPDATE SET avatar=excluded.avatar,avatar_revision=account_details.avatar_revision+1''',
+            (user['id'],cipher().encrypt(clean)))
+        event(db,user['id'],'account_avatar_update')
+        return account(db,user)
+
+@router.get('/avatar')
+async def get_avatar(request:Request):
+    user=current(request)
+    with connect() as db:row=db.execute('SELECT avatar FROM account_details WHERE user_id=?',(user['id'],)).fetchone()
+    if not row or not row['avatar']:raise HTTPException(404,'尚未设置头像。')
+    try:image=cipher().decrypt(row['avatar'])
+    except Exception:raise HTTPException(409,'头像不可读取，请重新上传。') from None
+    return Response(image,media_type='image/png',headers={'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'})
+
+@router.delete('/avatar')
+async def remove_avatar(request:Request):
+    user=current(request)
+    with connect() as db:
+        write_guard(db,user)
+        db.execute('UPDATE account_details SET avatar=NULL,avatar_revision=avatar_revision+1 WHERE user_id=?',(user['id'],))
+        event(db,user['id'],'account_avatar_remove')
+        return account(db,user)
+```
+
+### `app/recruitment_api.py`
+
+```python
+"""Consent-scoped applications. Companies never receive private interview content."""
+import json
+from typing import Literal
+from fastapi import APIRouter,HTTPException,Request,Response
+from pydantic import Field
+from .api import Input,payload
+from .database import connect,cipher,encode,event
+from .platform_api import current,write_guard
+from .company_api import membership
+from .services.resume_builder import Draft,FIELDS
+
+router=APIRouter(prefix='/api')
+
+class Apply(Input):
+    resume_source:Literal['profile','studio']
+    resume_session_id:str|None=Field(default=None,max_length=100)
+    share_resume:bool=False
+    interview_consent:bool=False
+
+
+def public_job(db,jid):
+    row=db.execute("""SELECT j.*,l.company_id FROM jobs j JOIN job_company_links l ON l.job_id=j.id
+      JOIN companies c ON c.id=l.company_id WHERE j.id=? AND j.active=1 AND j.status='approved' AND c.status='approved'""",(jid,)).fetchone()
+    if not row:raise HTTPException(404,'岗位未公开、已下架或企业材料尚未通过平台审核。')
+    return dict(row)
+
+
+def validate_application(db,user,application_id,occupation=None):
+    row=db.execute("SELECT * FROM job_applications WHERE id=? AND user_id=? AND status='active' AND share_resume=1 AND interview_consent=1",(application_id,user['id'])).fetchone()
+    if not row:raise HTTPException(404,'投递不存在、已撤回或未授权岗位面试。')
+    job=public_job(db,row['job_id'])
+    if row['company_id']!=job['company_id'] or row['occupation']!=job['title'] or row['jd']!=job['description']:
+        raise HTTPException(409,'岗位内容已更新，请重新确认授权后面试。')
+    if occupation is not None and occupation!=row['occupation']:raise HTTPException(422,'面试岗位必须与授权投递一致。')
+    return dict(row)
+
+
+def attach_interview(db,user,application_id,interview_id,occupation=None):
+    application=validate_application(db,user,application_id,occupation)
+    row=db.execute('SELECT user_id,occupation FROM interviews WHERE id=?',(interview_id,)).fetchone()
+    if not row or row['user_id']!=user['id'] or row['occupation']!=application['occupation']:
+        raise HTTPException(422,'面试记录与授权账号或岗位不一致。')
+    db.execute('INSERT OR IGNORE INTO application_interviews(application_id,interview_id) VALUES (?,?)',(application_id,interview_id))
+
+
+def snapshot(db,user,data):
+    if data.resume_source=='profile':
+        row=db.execute('SELECT resume FROM profiles WHERE user_id=?',(user['id'],)).fetchone()
+        if not row or not row['resume'].strip():raise HTTPException(422,'请先保存个人简历，或选择简历工作室中的简历。')
+        return {'source':'profile','text':row['resume']}
+    row=db.execute('SELECT content FROM resume_sessions WHERE id=? AND user_id=?',(data.resume_session_id,user['id'])).fetchone()
+    if not row:raise HTTPException(404,'所选简历不存在或不属于当前账号。')
+    draft=Draft.model_validate(json.loads(cipher().decrypt(row['content'].encode()))['draft']).model_dump()
+    if not any(draft.values()):raise HTTPException(422,'所选简历为空，请先填写真实资料。')
+    return {'source':'studio','fields':draft,'text':'\n\n'.join(FIELDS[k]+'\n'+v for k,v in draft.items() if v)}
+
+
+@router.post('/jobs/{jid}/apply')
+async def apply(jid:int,request:Request):
+    user=current(request);data=await payload(request,Apply)
+    if user['role']=='company':raise HTTPException(403,'企业账号不能作为求职者投递。')
+    if not data.share_resume:raise HTTPException(422,'请主动同意向本岗位企业共享所选简历快照。')
+    with connect() as db:
+        write_guard(db,user);job=public_job(db,jid);resume=snapshot(db,user,data)
+        encrypted=cipher().encrypt(encode(resume).encode())
+        db.execute("""INSERT INTO job_applications(user_id,job_id,company_id,resume_source,resume_encrypted,share_resume,interview_consent,occupation,jd)
+          VALUES (?,?,?,?,?,1,?,?,?) ON CONFLICT(user_id,job_id) DO UPDATE SET resume_source=excluded.resume_source,
+          resume_encrypted=excluded.resume_encrypted,share_resume=1,interview_consent=excluded.interview_consent,
+          occupation=excluded.occupation,jd=excluded.jd,status='active',updated=CURRENT_TIMESTAMP""",
+          (user['id'],jid,job['company_id'],data.resume_source,encrypted,int(data.interview_consent),job['title'],job['description']))
+        aid=db.execute('SELECT id FROM job_applications WHERE user_id=? AND job_id=?',(user['id'],jid)).fetchone()[0]
+        event(db,user['id'],'application_share')
+    return {'id':aid,'application_id':aid,'job':job,'occupation':job['title'],'jd':job['description']}
+
+
+@router.get('/applications')
+async def applications(request:Request,response:Response):
+    user=current(request);response.headers['Cache-Control']='no-store'
+    with connect() as db:
+        rows=db.execute('''SELECT a.id,a.job_id,a.status,a.share_resume,a.interview_consent,a.created,a.updated,j.title,j.company
+          FROM job_applications a JOIN jobs j ON j.id=a.job_id WHERE a.user_id=? ORDER BY a.updated DESC,a.id DESC LIMIT 200''',(user['id'],)).fetchall()
+    return {'items':[dict(r) for r in rows]}
+
+
+@router.delete('/applications/{aid}')
+async def withdraw(aid:int,request:Request):
+    user=current(request)
+    with connect() as db:
+        write_guard(db,user)
+        n=db.execute("UPDATE job_applications SET status='withdrawn',share_resume=0,interview_consent=0,resume_encrypted=NULL,updated=CURRENT_TIMESTAMP WHERE id=? AND user_id=?",(aid,user['id'])).rowcount
+        if not n:raise HTTPException(404,'投递不存在。')
+        event(db,user['id'],'application_withdraw')
+    return {'withdrawn':True}
+
+
+def candidate_view(db,company,aid):
+    row=db.execute("""SELECT a.id,a.user_id,a.job_id,a.created,a.updated,a.resume_encrypted,j.title,u.username,
+      CASE WHEN a.interview_consent=1 THEN (SELECT COUNT(*) FROM application_interviews ai WHERE ai.application_id=a.id) ELSE 0 END AS interview_count
+      FROM job_applications a JOIN jobs j ON j.id=a.job_id JOIN users u ON u.id=a.user_id
+      WHERE a.id=? AND a.company_id=? AND a.status='active' AND a.share_resume=1 AND u.disabled=0""",(aid,company['id'])).fetchone()
+    if not row:raise HTTPException(404,'候选人未授权、已撤回或不属于本企业。')
+    result=dict(row);result['resume']=json.loads(cipher().decrypt(result.pop('resume_encrypted')))
+    return result
+
+
+@router.get('/company/candidates')
+async def candidates(request:Request,response:Response,job_id:int|None=None):
+    user=current(request);response.headers['Cache-Control']='no-store'
+    with connect() as db:
+        company=membership(db,user,True)
+        if job_id is not None and not db.execute('SELECT 1 FROM job_company_links WHERE job_id=? AND company_id=?',(job_id,company['id'])).fetchone():raise HTTPException(404,'岗位不属于本企业。')
+        rows=db.execute("""SELECT a.id FROM job_applications a JOIN users u ON u.id=a.user_id
+          WHERE a.company_id=? AND a.status='active' AND a.share_resume=1 AND u.disabled=0
+          AND (? IS NULL OR a.job_id=?) ORDER BY a.updated DESC,a.id DESC LIMIT 500""",(company['id'],job_id,job_id)).fetchall()
+        items=[candidate_view(db,company,r['id']) for r in rows]
+        stats=db.execute("""SELECT j.id AS job_id,COUNT(DISTINCT CASE WHEN a.status='active' AND a.share_resume=1 AND u.disabled=0 THEN a.user_id END) AS applicant_count,
+          COUNT(DISTINCT CASE WHEN ai.interview_id IS NOT NULL AND a.interview_consent=1 AND a.status='active' AND a.share_resume=1 AND u.disabled=0 THEN a.user_id END) AS interview_users
+          FROM jobs j JOIN job_company_links l ON l.job_id=j.id LEFT JOIN job_applications a ON a.job_id=j.id
+          LEFT JOIN users u ON u.id=a.user_id LEFT JOIN application_interviews ai ON ai.application_id=a.id
+          WHERE l.company_id=? GROUP BY j.id""",(company['id'],)).fetchall()
+    return {'items':items,'jobs':[dict(r) for r in stats]}
+
+
+@router.get('/company/candidates/{aid}')
+async def candidate(aid:int,request:Request,response:Response):
+    user=current(request);response.headers['Cache-Control']='no-store'
+    with connect() as db:return candidate_view(db,membership(db,user,True),aid)
+
+
+def clear_user_applications(db,uid):
+    """Call in personal-data deletion transaction; revoke access and erase snapshots."""
+    db.execute("UPDATE job_applications SET status='withdrawn',share_resume=0,interview_consent=0,resume_encrypted=NULL,updated=CURRENT_TIMESTAMP WHERE user_id=?",(uid,))
+```
+
+### `app/mail_api.py`
+
+```python
+"""Station mail endpoints. GET never creates messages or changes read state."""
+import asyncio
+import hashlib
+import secrets
+import time
+from fastapi import APIRouter,HTTPException,Request,Query
+from pydantic import Field
+from .api import Input,payload
+from .platform_api import current,write_guard
+from .database import connect,event
+from .services import mail
+
+router=APIRouter(prefix='/api')
+class Compose(Input):
+    application_id:int|None=Field(default=None,gt=0)
+    recipient_id:int|None=Field(default=None,gt=0)
+    subject:str=Field(min_length=1,max_length=160)
+    body:str=Field(min_length=1,max_length=12000)
+    sync_email:bool=False
+class Reply(Input):
+    body:str=Field(min_length=1,max_length=12000)
+    sync_email:bool=False
+class Address(Input):
+    email:str=Field(max_length=254)
+    consent:bool=False
+class Code(Input):
+    code:str=Field(pattern=r'^\d{6}$')
+class SMTP(Input):
+    host:str=Field(max_length=253)
+    port:int=587
+    username:str=Field(min_length=1,max_length=254)
+    password:str=Field(default='',max_length=512)
+    from_address:str=Field(max_length=254)
+    enabled:bool=False
+
+def subject_text(text):
+    if not text.strip() or any(ord(x)<32 or ord(x)==127 for x in text):raise HTTPException(422,'主题不能为空或含控制字符。')
+    return text.strip()
+def body_text(text):
+    if not text.strip():raise HTTPException(422,'请填写正文。')
+    return text.strip()
+def state(db,uid):
+    return {'cursor':db.execute('SELECT COALESCE(MAX(id),0) FROM mail_messages WHERE sender_id=? OR recipient_id=?',(uid,uid)).fetchone()[0], 'unread':db.execute('SELECT COUNT(*) FROM mail_messages WHERE recipient_id=? AND read_at IS NULL',(uid,)).fetchone()[0]}
+def summary(db,uid,sent=False):
+    column='sender_id' if sent else 'recipient_id'
+    rows=db.execute(f'''SELECT t.id,t.subject,t.application_id,t.created,MAX(m.id) AS last_message_id,COUNT(CASE WHEN m.recipient_id=? AND m.read_at IS NULL THEN 1 END) AS unread FROM mail_threads t JOIN mail_messages m ON m.thread_id=t.id WHERE EXISTS(SELECT 1 FROM mail_messages x WHERE x.thread_id=t.id AND x.{column}=?) GROUP BY t.id ORDER BY last_message_id DESC LIMIT 100''',(uid,uid)).fetchall()
+    return {'items':[dict(r) for r in rows],**state(db,uid),'mode':'internal_mail'}
+
+@router.get('/mail/inbox')
+async def inbox(request:Request):
+    u=current(request)
+    with connect() as db:return summary(db,u['id'])
+@router.get('/mail/sent')
+async def sent(request:Request):
+    u=current(request)
+    with connect() as db:return summary(db,u['id'],True)
+@router.get('/mail/events')
+async def events(request:Request,after:int=Query(0,ge=0),timeout:float=Query(0,ge=0,le=20)):
+    u=current(request);deadline=time.monotonic()+timeout
+    while True:
+        with connect() as db:
+            live=db.execute('SELECT disabled,data_generation FROM users WHERE id=?',(u['id'],)).fetchone()
+            if not live or live['disabled']:raise HTTPException(401,'账号已停用，请重新登录。')
+            if live['data_generation']!=u['data_generation']:raise HTTPException(409,'账号数据已变更，请刷新页面。')
+            data=state(db,u['id'])
+        if data['cursor']>after or time.monotonic()>=deadline or await request.is_disconnected():return data
+        await asyncio.sleep(.5)
+@router.post('/mail/threads')
+async def compose(request:Request):
+    u=current(request);d=await payload(request,Compose);subject=subject_text(d.subject);body=body_text(d.body)
+    with connect() as db:
+        write_guard(db,u);mail.limit(db,u['id'])
+        company=None
+        if u['role']=='company':
+            if d.recipient_id is not None:raise HTTPException(422,'收件人由投递记录确定，请勿指定收件人。')
+            a=mail.application(db,d.application_id,u['id']);recipient=a['user_id'];company=a['linked_company']
+        elif u['role']=='admin':
+            if d.application_id or not d.recipient_id:raise HTTPException(422,'管理员通知需指定站内用户编号。')
+            recipient=d.recipient_id
+        else:raise HTTPException(403,'求职者可回复已有邮件。')
+        if recipient==u['id'] or not db.execute('SELECT 1 FROM users WHERE id=? AND disabled=0',(recipient,)).fetchone():raise HTTPException(404,'收件用户不存在。')
+        tid=db.execute('INSERT INTO mail_threads(application_id,company_id,candidate_id,creator_id,subject) VALUES (?,?,?,?,?)',(d.application_id,company,recipient,u['id'],subject)).lastrowid
+        mid=db.execute('INSERT INTO mail_messages(thread_id,sender_id,recipient_id,body_encrypted) VALUES (?,?,?,?)',(tid,u['id'],recipient,mail.encrypt(body))).lastrowid
+        event(db,u['id'],'mail_send')
+        event(db,u['id'],'mail_delivery_internal')
+    delivery=await asyncio.to_thread(mail.deliver,mid,recipient,subject,body,d.sync_email)
+    return {'id':tid,'message_id':mid,'delivery':delivery,'internal_delivered':True}
+@router.get('/mail/threads/{tid}')
+async def get_thread(tid:int,request:Request):
+    u=current(request)
+    with connect() as db:
+        t=mail.thread(db,tid,u['id'])
+        messages=db.execute('SELECT m.*,s.username AS sender FROM mail_messages m JOIN users s ON s.id=m.sender_id WHERE thread_id=? ORDER BY m.id LIMIT 500',(tid,)).fetchall()
+        return {**dict(t),'messages':[{k:r[k] for k in ('id','sender_id','recipient_id','sender','read_at','delivery','created')}|{'body':mail.decrypt(r['body_encrypted'])} for r in messages]}
+@router.post('/mail/threads/{tid}/read')
+async def read_thread(tid:int,request:Request):
+    u=current(request)
+    with connect() as db:
+        write_guard(db,u);mail.thread(db,tid,u['id']);db.execute('UPDATE mail_messages SET read_at=CURRENT_TIMESTAMP WHERE thread_id=? AND recipient_id=? AND read_at IS NULL',(tid,u['id']))
+        event(db,u['id'],'mail_read')
+        return state(db,u['id'])
+@router.post('/mail/threads/{tid}/reply')
+async def reply(tid:int,request:Request):
+    u=current(request);d=await payload(request,Reply);body=body_text(d.body)
+    with connect() as db:
+        write_guard(db,u);t=mail.thread(db,tid,u['id']);mail.limit(db,u['id'])
+        if u['id']!=t['candidate_id'] and t['application_id']:mail.application(db,t['application_id'],u['id'])
+        recipient=t['creator_id'] if u['id']==t['candidate_id'] else t['candidate_id']
+        if not db.execute('SELECT 1 FROM users WHERE id=? AND disabled=0',(recipient,)).fetchone():raise HTTPException(404,'收件用户不可用。')
+        mid=db.execute('INSERT INTO mail_messages(thread_id,sender_id,recipient_id,body_encrypted) VALUES (?,?,?,?)',(tid,u['id'],recipient,mail.encrypt(body))).lastrowid
+        subject=t['subject']
+        event(db,u['id'],'mail_reply')
+        event(db,u['id'],'mail_delivery_internal')
+    return {'id':tid,'message_id':mid,'delivery':await asyncio.to_thread(mail.deliver,mid,recipient,subject,body,d.sync_email),'internal_delivered':True}
+
+@router.get('/mail/address')
+async def get_address(request:Request):
+    u=current(request)
+    with connect() as db:
+        row=db.execute('SELECT * FROM mail_addresses WHERE user_id=?',(u['id'],)).fetchone();conf=mail.smtp_config(db)
+    return {'email':mail.decrypt(row['email_encrypted']) if row else '', 'verified':bool(row and row['verified']),'consent':bool(row and row['consent']),'outbound_available':bool(conf and conf.get('enabled'))}
+@router.post('/mail/address')
+async def set_address(request:Request):
+    u=current(request);d=await payload(request,Address);email=mail.email_address(d.email)
+    with connect() as db:
+        write_guard(db,u);mail.limit(db,u['id'])
+        old=db.execute('SELECT * FROM mail_addresses WHERE user_id=?',(u['id'],)).fetchone()
+        verified=bool(old and old['verified'] and mail.decrypt(old['email_encrypted'])==email)
+        db.execute('INSERT INTO mail_addresses(user_id,email_encrypted,verified,consent) VALUES (?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET email_encrypted=excluded.email_encrypted,verified=excluded.verified,consent=excluded.consent,code_hash=NULL,code_expires=NULL,attempts=0',(u['id'],mail.encrypt(email),int(verified),int(d.consent)))
+        event(db,u['id'],'mail_address_save')
+    return {'verified':verified,'message':'邮箱已保存；验证后才可接收外发邮件。'}
+@router.post('/mail/address/send-code')
+async def send_code(request:Request):
+    u=current(request);code=str(secrets.randbelow(1000000)).zfill(6)
+    code_digest=hashlib.sha256((str(u['id'])+':'+code).encode()).hexdigest()
+    with connect() as db:
+        write_guard(db,u);mail.limit(db,u['id'],5);row=db.execute('SELECT * FROM mail_addresses WHERE user_id=?',(u['id'],)).fetchone();conf=mail.smtp_config(db)
+        if not row or not conf or not conf.get('enabled'):raise HTTPException(409,'请先保存邮箱，且管理员需启用SMTP。')
+        db.execute('UPDATE mail_addresses SET code_hash=?,code_expires=?,attempts=0 WHERE user_id=?',(code_digest,int(time.time())+600,u['id']))
+        destination=mail.decrypt(row['email_encrypted'])
+    try:await asyncio.to_thread(mail.send_email,conf,destination,'Career Guard 邮箱验证','验证码：'+code+'，十分钟有效。')
+    except Exception:
+        with connect() as db:
+            db.execute('UPDATE mail_addresses SET code_hash=NULL WHERE user_id=? AND code_hash=?',(u['id'],code_digest))
+            event(db,u['id'],'mail_code_failed')
+        raise HTTPException(502,'验证码发送失败，请检查SMTP配置后重试。') from None
+    with connect() as db:event(db,u['id'],'mail_code_sent')
+    return {'sent':True}
+@router.post('/mail/address/verify')
+async def verify_address(request:Request):
+    u=current(request);d=await payload(request,Code)
+    with connect() as db:
+        write_guard(db,u);row=db.execute('SELECT * FROM mail_addresses WHERE user_id=?',(u['id'],)).fetchone()
+        valid=bool(row and row['code_hash'] and row['code_expires']>=int(time.time()) and row['attempts']<5)
+        digest=hashlib.sha256((str(u['id'])+':'+d.code).encode()).hexdigest()
+        valid=valid and secrets.compare_digest(digest,row['code_hash'])
+        if row:db.execute('UPDATE mail_addresses SET attempts=attempts+1 WHERE user_id=?',(u['id'],))
+        if valid:db.execute('UPDATE mail_addresses SET verified=1,code_hash=NULL WHERE user_id=?',(u['id'],))
+        event(db,u['id'],'mail_address_verified' if valid else 'mail_address_verify_failed')
+    if not valid:raise HTTPException(422,'验证码无效、过期或尝试次数过多。')
+    return {'verified':True}
+@router.get('/admin/mail/config')
+async def get_config(request:Request):
+    current(request,True)
+    with connect() as db:conf=mail.smtp_config(db)
+    return ({k:v for k,v in conf.items() if k!='password'}|{'password_configured':bool(conf.get('password'))}) if conf else {'enabled':False,'password_configured':False}
+@router.post('/admin/mail/config')
+async def save_config(request:Request):
+    u=current(request,True);d=await payload(request,SMTP);conf=mail.validate_config(d.model_dump())
+    with connect() as db:
+        write_guard(db,u);old=mail.smtp_config(db)
+        if not conf['password'] and old and old['host']==conf['host'] and old['username']==conf['username']:conf['password']=old['password']
+        if conf['enabled'] and not conf['password']:raise HTTPException(422,'启用SMTP需填写密码。')
+        import json
+        db.execute("INSERT INTO settings(name,value) VALUES ('mail-smtp',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",(mail.encrypt(json.dumps(conf)).decode(),))
+        event(db,u['id'],'mail_smtp_save')
+        if bool(old and old.get('enabled'))!=conf['enabled']:
+            event(db,u['id'],'mail_smtp_enabled' if conf['enabled'] else 'mail_smtp_disabled')
+    return {'saved':True,'enabled':conf['enabled'],'notice':'配置已保存，未连接或测试SMTP。'}
+```
+
+### `app/services/recruitment_schema.py`
+
+```python
+"""Explicit resume sharing and server-owned interview links."""
+SCHEMA='''
+CREATE TABLE IF NOT EXISTS job_applications(
+ id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+ company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+ resume_source TEXT NOT NULL CHECK(resume_source IN ('profile','studio')),
+ resume_encrypted BLOB,share_resume INTEGER NOT NULL DEFAULT 0,
+ interview_consent INTEGER NOT NULL DEFAULT 0,
+ status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','withdrawn')),
+ occupation TEXT NOT NULL,jd TEXT NOT NULL,
+ created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE(user_id,job_id));
+CREATE INDEX IF NOT EXISTS application_company ON job_applications(company_id,job_id,status);
+CREATE TABLE IF NOT EXISTS application_interviews(
+ application_id INTEGER NOT NULL REFERENCES job_applications(id) ON DELETE CASCADE,
+ interview_id INTEGER NOT NULL UNIQUE REFERENCES interviews(id) ON DELETE CASCADE,
+ created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(application_id,interview_id));
+'''
+```
+
+### `app/services/mail_schema.py`
+
+```python
+"""Station mail schema. No initialization side effects."""
+SCHEMA = '''
+CREATE TABLE IF NOT EXISTS mail_threads(id INTEGER PRIMARY KEY,application_id INTEGER REFERENCES job_applications(id),company_id INTEGER REFERENCES companies(id),candidate_id INTEGER NOT NULL REFERENCES users(id),creator_id INTEGER NOT NULL REFERENCES users(id),subject TEXT NOT NULL,created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS mail_messages(id INTEGER PRIMARY KEY,thread_id INTEGER NOT NULL REFERENCES mail_threads(id) ON DELETE CASCADE,sender_id INTEGER NOT NULL REFERENCES users(id),recipient_id INTEGER NOT NULL REFERENCES users(id),body_encrypted BLOB NOT NULL,read_at TEXT,delivery TEXT NOT NULL DEFAULT 'internal',created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS mail_recipient ON mail_messages(recipient_id,id);
+CREATE INDEX IF NOT EXISTS mail_thread ON mail_messages(thread_id,id);
+CREATE TABLE IF NOT EXISTS mail_addresses(user_id INTEGER PRIMARY KEY REFERENCES users(id),email_encrypted BLOB NOT NULL,verified INTEGER NOT NULL DEFAULT 0,consent INTEGER NOT NULL DEFAULT 0,code_hash TEXT,code_expires INTEGER,attempts INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS mail_actions(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id),created INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS mail_action_user ON mail_actions(user_id,created);
+'''
+```
+
+### `app/services/mail.py`
+
+```python
+"""Encrypted internal mail and opt-in SMTP. No transport runs when saving configuration."""
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import smtplib
+import socket
+import ssl
+import time
+from email.message import EmailMessage
+from fastapi import HTTPException
+from ..database import cipher
+
+OFFICIAL_HOSTS={'smtp.qq.com','smtp.163.com','smtp.126.com','smtp.gmail.com','smtp.office365.com','smtp-mail.outlook.com','smtp.exmail.qq.com','smtp.feishu.cn','smtp.qiye.aliyun.com'}
+
+def encrypt(text):return cipher().encrypt(text.encode())
+def decrypt(blob):return cipher().decrypt(blob).decode()
+
+def email_address(value):
+    value=value.strip()
+    if len(value)>254 or not re.fullmatch(r'[A-Za-z0-9.!#$%&\x27*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,63}',value):
+        raise HTTPException(422,'邮箱格式无效。')
+    return value
+
+def validate_config(data):
+    host=data['host'].strip().lower().rstrip('.')
+    allowed=OFFICIAL_HOSTS|{h.strip().lower() for h in os.getenv('SMTP_ALLOWED_HOSTS','').split(',') if h.strip()}
+    if host not in allowed or data['port'] not in (465,587) or not re.fullmatch(r'[a-z0-9.-]+',host):
+        raise HTTPException(422,'仅支持服务器允许的SMTP主机与465 SSL或587 STARTTLS。')
+    try:ipaddress.ip_address(host)
+    except ValueError:pass
+    else:raise HTTPException(422,'SMTP必须使用允许的域名。')
+    return {**data,'host':host,'from_address':email_address(data['from_address'])}
+
+def smtp_config(db):
+    row=db.execute("SELECT value FROM settings WHERE name='mail-smtp'").fetchone()
+    return json.loads(decrypt(row['value'].encode())) if row else None
+
+def send_email(config,to,subject,body):
+    """Resolve once, reject every nonpublic address, pin the socket while retaining TLS SNI."""
+    config=validate_config(config)
+    if not config.get('enabled'):raise ValueError('SMTP disabled')
+    addresses=socket.getaddrinfo(config['host'],config['port'],type=socket.SOCK_STREAM)
+    if not addresses or any(not ipaddress.ip_address(a[4][0]).is_global for a in addresses):
+        raise ValueError('Nonpublic SMTP destination')
+    address=addresses[0][4][0]
+    context=ssl.create_default_context()
+    class PinnedSMTP(smtplib.SMTP):
+        def _get_socket(self,host,port,timeout):return socket.create_connection((address,port),timeout)
+    class PinnedSSL(smtplib.SMTP_SSL):
+        def _get_socket(self,host,port,timeout):
+            raw=socket.create_connection((address,port),timeout)
+            try:return context.wrap_socket(raw,server_hostname=config['host'])
+            except Exception:raw.close();raise
+    transport=PinnedSSL(context=context,timeout=12) if config['port']==465 else PinnedSMTP(timeout=12)
+    transport._host=config['host']
+    with transport as smtp:
+        smtp.connect(config['host'],config['port']);smtp.ehlo()
+        if config['port']==587:smtp.starttls(context=context);smtp.ehlo()
+        smtp.login(config['username'],config['password'])
+        message=EmailMessage();message['From']=config['from_address'];message['To']=email_address(to);message['Subject']=subject
+        message.set_content(body)
+        smtp.send_message(message)
+
+def limit(db,uid,maximum=20):
+    now=int(time.time())
+    db.execute('DELETE FROM mail_actions WHERE created<?',(now-3600,))
+    if db.execute('SELECT COUNT(*) FROM mail_actions WHERE user_id=? AND created>?',(uid,now-60)).fetchone()[0]>=maximum:
+        raise HTTPException(429,'邮件操作过于频繁，请一分钟后重试。')
+    db.execute('INSERT INTO mail_actions(user_id,created) VALUES (?,?)',(uid,now))
+
+def application(db,aid,uid):
+    row=db.execute('''SELECT a.*,l.company_id AS linked_company FROM job_applications a JOIN jobs j ON j.id=a.job_id JOIN job_company_links l ON l.job_id=j.id JOIN company_memberships m ON m.company_id=l.company_id JOIN companies c ON c.id=l.company_id WHERE a.id=? AND m.user_id=? AND c.status='approved' ''',(aid,uid)).fetchone()
+    if not row or not row['share_resume'] or row['status']!='active' or row['company_id']!=row['linked_company']:
+        raise HTTPException(403,'仅可联系主动投递本企业岗位并授权共享简历的求职者。')
+    return row
+
+def thread(db,tid,uid):
+    row=db.execute('SELECT * FROM mail_threads WHERE id=?',(tid,)).fetchone()
+    if not row or (uid not in (row['candidate_id'],row['creator_id']) and not db.execute('SELECT 1 FROM mail_messages WHERE thread_id=? AND (sender_id=? OR recipient_id=?)',(tid,uid,uid)).fetchone()):
+        raise HTTPException(404,'邮件会话不存在。')
+    return row
+
+def deliver(mid,recipient,subject,body,sync):
+    if not sync:return 'internal'
+    from ..database import connect,event
+    with connect() as db:
+        row=db.execute('SELECT * FROM mail_addresses WHERE user_id=? AND verified=1 AND consent=1',(recipient,)).fetchone()
+        conf=smtp_config(db)
+    state='email_unavailable'
+    if row and conf and conf.get('enabled'):
+        try:send_email(conf,decrypt(row['email_encrypted']),subject,body);state='email_sent'
+        except Exception:state='email_failed'
+    with connect() as db:
+        message=db.execute('SELECT sender_id FROM mail_messages WHERE id=?',(mid,)).fetchone()
+        if message:
+            db.execute('UPDATE mail_messages SET delivery=? WHERE id=?',(state,mid))
+            event(db,message['sender_id'],'mail_delivery_'+state)
+    return state
+```
+
 ### 环境与启动文件
 
 ### `requirements.txt`
@@ -4022,6 +4616,9 @@ ENABLE_RISK_CLASSIFIER=0
 
 # 可选自定义模型网关主机，逗号分隔；仅HTTPS443公网地址，不允许网页抓取/重定向。
 MODEL_ALLOWED_HOSTS=
+
+# 自定义SMTP服务器域名（逗号分隔），465 SSL/587 STARTTLS；保存配置不探测或发送邮件。
+SMTP_ALLOWED_HOSTS=
 ```
 
 ### `start.ps1`
@@ -4640,7 +5237,7 @@ body[data-fx-mode=off] .star-energy{display:none}
     scope.querySelectorAll('.site-brand>img[src="/static/mark.svg"]').forEach(img=>img.replaceWith(newIcon('shield')));
     const glyphSelector='.star-orb,.star-detail-symbol,.star-career-item>span:first-child,.model-logo,.camera-tool-icon,.camera-placeholder>span,.voice-orb,.avatar,.top-avatar,.icon-button:not([data-action=close-dialog])';
     [...(scope.matches?.(glyphSelector)?[scope]:[]),...scope.querySelectorAll(glyphSelector)].forEach(el=>{
-      if(el.dataset.fxIcon)return;
+      if(el.dataset.fxIcon||el.classList.contains('account-nav-avatar'))return;
       let name='spark';
       const glyphName={'⌘':'grid','⬡':'tree','▥':'list','✦':'spark','◇':'shield','☁':'upload','✓':'check','▯':'file','⌁':'route'}[el.textContent.trim()];
       const node=el.closest('.star-node');
@@ -5359,15 +5956,25 @@ execute(async()=>{await bootstrap();await refreshMaterials();if(state.materials.
 </section>
 <section class="view" id="view-interview" hidden>
   <div class="page-heading"><div><h1>把经历，说得更清楚<span class="heading-dot">.</span></h1><p>AI 面试官逐轮提问、根据回答追问。支持实时转写、语音朗读、打断与文字回答。</p></div><span class="badge neutral">AI 面试练习</span></div>
-  <div class="interview-layout"><article class="panel"><div class="field"><label for="interview-occupation">面试岗位</label><input id="interview-occupation" maxlength="100" placeholder="例如：Python 后端实习生"></div><div class="field"><label for="interview-jd">岗位要求</label><textarea id="interview-jd" rows="3" maxlength="6000"></textarea></div><label class="check-line"><input id="interview-consent" type="checkbox">同意将岗位信息及逐轮回答发送至已配置模型，并保存文字练习记录。</label><button class="button primary" data-platform="start-interview">开始新面试</button><hr><label class="check-line"><input type="checkbox" id="voice-consent">启用语音：同意浏览器调用语音识别服务处理麦克风音频。实际服务由浏览器提供，可能联网。</label><label class="check-line"><input type="checkbox" id="voice-speak" checked>朗读面试官提问</label><label class="check-line"><input type="checkbox" id="voice-auto">语音回答结束后自动发送，并继续下一轮听写</label><div class="voice-orb" id="voice-orb" aria-hidden="true">✦</div><p class="voice-status" id="voice-status" role="status">文字和语音，都可以从容表达。</p><div class="button-row"><button class="button secondary" data-platform="listen" id="voice-listen">开始语音回答</button><button class="button subtle" data-platform="interrupt">停止听写 / 打断朗读</button></div><button class="button danger-soft spaced" data-platform="end-interview">结束本次面试</button><p class="fine-print">每轮回答最多 2500 字，每次语音最多 3 分钟，面试最多 12 轮。语音采用识别、AI追问、朗读的逐轮会话，网络与浏览器会影响延迟。</p></article><article class="panel interview-conversation"><div class="panel-header"><h3>对话现场</h3><span class="badge green" id="interview-round">等待开始</span></div><div id="interview-messages" class="conversation" aria-live="polite"><p class="empty-mini">面试官将在这里提出第一个岗位问题。</p></div><label for="interview-answer">你的回答</label><textarea id="interview-answer" rows="4" maxlength="2500" placeholder="可以输入回答，或点击语音回答实时转写。"></textarea><p id="voice-interim" class="fine-print" aria-live="polite"></p><div class="button-row"><button class="button primary" data-platform="send-answer">发送回答 ↗</button><span class="fine-print">Ctrl + Enter 发送</span></div></article></div>
+  <div id="interview-application-note" class="notice" hidden><p id="interview-application-context"></p><button class="button secondary small" data-platform="detach-application">切换为个人练习</button></div><div class="interview-layout"><article class="panel"><div class="field"><label for="interview-occupation">面试岗位</label><input id="interview-occupation" maxlength="160" placeholder="例如：Python 后端实习生"></div><div class="field"><label for="interview-jd">岗位要求</label><textarea id="interview-jd" rows="3" maxlength="12000"></textarea></div><label class="check-line"><input id="interview-consent" type="checkbox">同意将岗位信息及逐轮回答发送至已配置模型，并保存文字练习记录。</label><button class="button primary" data-platform="start-interview">开始新面试</button><hr><label class="check-line"><input type="checkbox" id="voice-consent">启用语音：同意浏览器调用语音识别服务处理麦克风音频。实际服务由浏览器提供，可能联网。</label><label class="check-line"><input type="checkbox" id="voice-speak" checked>朗读面试官提问</label><label class="check-line"><input type="checkbox" id="voice-auto">语音回答结束后自动发送，并继续下一轮听写</label><div class="voice-orb" id="voice-orb" aria-hidden="true">✦</div><p class="voice-status" id="voice-status" role="status">文字和语音，都可以从容表达。</p><div class="button-row"><button class="button secondary" data-platform="listen" id="voice-listen">开始语音回答</button><button class="button subtle" data-platform="interrupt">停止听写 / 打断朗读</button></div><button class="button danger-soft spaced" data-platform="end-interview">结束本次面试</button><p class="fine-print">每轮回答最多 2500 字，每次语音最多 3 分钟，面试最多 12 轮。语音采用识别、AI追问、朗读的逐轮会话，网络与浏览器会影响延迟。</p></article><article class="panel interview-conversation"><div class="panel-header"><h3>对话现场</h3><span class="badge green" id="interview-round">等待开始</span></div><div id="interview-messages" class="conversation" aria-live="polite"><p class="empty-mini">面试官将在这里提出第一个岗位问题。</p></div><label for="interview-answer">你的回答</label><textarea id="interview-answer" rows="4" maxlength="2500" placeholder="可以输入回答，或点击语音回答实时转写。"></textarea><p id="voice-interim" class="fine-print" aria-live="polite"></p><div class="button-row"><button class="button primary" data-platform="send-answer">发送回答 ↗</button><span class="fine-print">Ctrl + Enter 发送</span></div></article></div>
 </section>
 <section class="view" id="view-jobs" hidden>
   <div class="page-heading"><div><h1>带着判断，发现新机会<span class="heading-dot">.</span></h1><p>管理员推荐与用户分享分别标注。推荐不代表已核验，点评属于用户个人体验。</p></div><button class="button secondary" data-platform="load-jobs">刷新岗位</button></div><div class="field"><label for="job-search">搜索公司或岗位</label><input id="job-search" placeholder="搜索公司、职位或技能关键词"></div><div id="job-list" class="jobs-grid"></div><article class="panel spaced"><h3>我的岗位提交</h3><div id="my-job-list" class="stack"></div></article><details class="panel spaced"><summary>手动添加一个岗位</summary><div class="career-inputs"><div class="field"><label for="job-title">岗位名称</label><input id="job-title" maxlength="100"></div><div class="field"><label for="job-company">公司名称</label><input id="job-company" maxlength="100"></div></div><div class="field"><label for="job-description">岗位描述</label><textarea id="job-description" rows="4" maxlength="8000"></textarea></div><label class="check-line" id="job-recommend-label" hidden><input id="job-recommended" type="checkbox">发布为管理员推荐岗位</label><p class="fine-print">提交后需管理员审核，通过后才向其他用户展示。请避免个人联系方式。</p><button class="button primary" data-platform="publish-job">提交审核</button></details>
 </section>
 <section class="view" id="view-profile" hidden>
   <div class="page-heading"><div><h1>积累的每一步，都在这里<span class="heading-dot">.</span></h1><p id="account-status">登录后保存目标职业、简历摘要、技能路线、考试和面试记录。</p></div><button class="button secondary" data-platform="refresh-profile">刷新个人资料</button></div>
-  <div class="two-col"><article class="panel"><div class="panel-header"><h3>账号</h3><span class="badge green" id="account-role">访客</span></div><div id="signed-in"><p id="signed-name"></p><p class="fine-print">资料与学习进度已关联当前账号。</p><button class="button secondary" data-platform="logout">退出登录</button></div></article><article class="panel"><h3>我的求职档案</h3><div class="field"><label for="profile-occupation">目标岗位 / 职业</label><input id="profile-occupation" maxlength="100"></div><div class="field"><label for="profile-resume">简历与项目经历摘要</label><textarea id="profile-resume" rows="6" maxlength="12000" placeholder="填写技能、项目任务和成果，避免姓名、证件号等敏感内容。"></textarea></div><p class="fine-print">保存求职档案后，可随时用于岗位匹配与职业规划。</p><div class="button-row"><button class="button primary" data-platform="save-profile">保存档案</button><button class="button secondary" data-platform="use-profile">用于职业规划</button></div></article></div>
-  <article class="panel spaced"><h3>我的求职材料</h3><div id="profile-materials" class="stack"></div></article><article class="panel spaced"><h3>已保存的职业报告</h3><div id="profile-reports" class="stack"></div></article><div class="section-heading"><h2>我的错题本</h2><button class="button secondary" data-platform="practice">随机抽题练习 ↗</button></div><div id="wrongbook-list" class="jobs-grid"><p class="empty-mini">登录后查看你的错题。</p></div><article class="panel spaced"><h3>我的考试记录</h3><div id="exam-history" class="stack"></div></article><article class="panel spaced"><h3>面试练习记录</h3><div id="interview-history" class="stack"></div></article><article class="panel spaced"><h3>我的资料管理</h3><p class="fine-print">可删除账号中保存的材料、档案、报告、路线、考试、错题和面试记录。</p><button class="button danger-soft" data-platform="erase-learning">删除个人档案与学习记录</button></article>
+  <div class="two-col"><article class="panel account-card" aria-labelledby="account-card-heading">
+    <div class="account-card-cover" aria-hidden="true"><span>YOUR OWN CHAPTER</span></div>
+    <div class="account-card-content" id="signed-in">
+      <div class="account-identity-row"><button type="button" class="account-avatar-button" id="account-change-avatar" aria-label="更换头像" title="点击更换头像"><span id="account-avatar" class="account-avatar-image">我</span><span class="account-avatar-edit" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M8 5 9.5 3h5L16 5h4v15H4V5Z"/><circle cx="12" cy="12" r="4"/></svg></span></button><span class="badge green" id="account-role">已登录</span></div>
+      <input id="account-avatar-file" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+      <div class="account-card-title"><div><p class="account-kicker" id="account-card-heading">我的个人资料</p><h2 id="signed-name">我的账号</h2><p id="account-username" class="account-handle"></p></div><button type="button" class="button secondary small" id="account-edit">编辑资料 <span aria-hidden="true">↗</span></button></div>
+      <p class="account-bio" id="account-bio">用一句话，记录你的职业目标与个人风格。</p>
+      <div class="account-meta"><span id="account-city">尚未填写城市</span><span id="account-joined"></span></div>
+      <div class="account-card-footer"><p id="account-card-status" class="fine-print" role="status" aria-live="polite">点击头像即可更换，支持 PNG、JPEG、WebP。</p><button class="button secondary small" data-platform="logout">退出登录</button></div>
+    </div>
+  </article><article class="panel"><h3>我的求职档案</h3><button class="button secondary small" data-platform="my-applications">我的岗位投递 ↗</button><div class="field"><label for="profile-occupation">目标岗位 / 职业</label><input id="profile-occupation" maxlength="100"></div><div class="field"><label for="profile-resume">简历与项目经历摘要</label><textarea id="profile-resume" rows="6" maxlength="12000" placeholder="填写技能、项目任务和成果，避免姓名、证件号等敏感内容。"></textarea></div><p class="fine-print">保存求职档案后，可随时用于岗位匹配与职业规划。</p><div class="button-row"><button class="button primary" data-platform="save-profile">保存档案</button><button class="button secondary" data-platform="use-profile">用于职业规划</button></div></article></div>
+  <article class="panel spaced"><h3>我的求职材料</h3><div id="profile-materials" class="stack"></div></article><article class="panel spaced"><h3>已保存的职业报告</h3><div id="profile-reports" class="stack"></div></article><div class="section-heading"><h2>我的错题本</h2><button class="button secondary" data-platform="practice">随机抽题练习 ↗</button></div><div id="wrongbook-list" class="jobs-grid"><p class="empty-mini">登录后查看你的错题。</p></div><article class="panel spaced"><h3>我的考试记录</h3><div id="exam-history" class="stack"></div></article><article class="panel spaced"><h3>面试练习记录</h3><div id="interview-history" class="stack"></div></article><article class="panel spaced"><h3>我的资料管理</h3><p class="fine-print">可删除账号中保存的头像、昵称、简介、材料、档案、报告、路线、考试、错题和面试记录。</p><button class="button danger-soft" data-platform="erase-learning">删除个人档案与学习记录</button></article>
 </section>
 
 <dialog id="review-dialog"><div class="dialog-header"><h2 id="review-title">岗位点评</h2><button class="icon-button" data-action="close-dialog" aria-label="关闭点评">×</button></div><p class="fine-print">点评代表个人体验，未经平台事实核验。请勿发布个人隐私和未经核实的指控。</p><div id="review-list" class="stack"></div><div class="field"><label for="review-rating">评分</label><select id="review-rating"><option value="5">5 分</option><option value="4">4 分</option><option value="3">3 分</option><option value="2">2 分</option><option value="1">1 分</option></select></div><div class="field"><label for="review-body">我的体验（至少 5 字）</label><textarea id="review-body" rows="3" maxlength="1000"></textarea></div><button class="button primary" data-platform="save-review">提交 / 更新点评</button></dialog>
@@ -5378,7 +5985,7 @@ execute(async()=>{await bootstrap();await refreshMaterials();if(state.materials.
 ```javascript
 'use strict';
 // 原生界面扩展。所有用户和模型内容以 textContent 渲染。
-const platform={user:null,tree:null,jobs:[],exam:null,interview:null,reviewJob:null,
+const platform={user:null,tree:null,jobs:[],exam:null,interview:null,reviewJob:null,applicationId:null,applicationJob:null,
   skills:[],pending:false,recognition:null,listening:false,voiceTimer:null,silenceTimer:null,voiceEpoch:0,interviewEpoch:0};
 const extTitles={tree:'职业技能树',exam:'技能考试',interview:'AI 面试',jobs:'岗位推荐',profile:'个人中心'};
 Object.assign(titles,extTitles);
@@ -5408,6 +6015,7 @@ async function loadAccount(){
   const footer=$('.sidebar-footer');
   footer.replaceChildren(node('span','avatar',u?u.username[0].toUpperCase():'访'));
   const info=node('span','',u?u.username:'访客');footer.append(info,node('span','online-dot'));
+  if(window.AccountCard)await window.AccountCard.load(u);
 }
 async function logout(){
   platform.editJob=null;window.CameraAssist?.stop();
@@ -5416,7 +6024,8 @@ async function logout(){
   location.assign('/');
 }
 function resetPlatform(){
-  platform.editJob=null;window.CameraAssist?.stop();window.StarMap?.clearAll();
+  platform.editJob=null;platform.applicationId=null;platform.applicationJob=null;window.CameraAssist?.stop();window.StarMap?.clearAll();
+  if($('#interview-application-note'))$('#interview-application-note').hidden=true;
   stopVoice();platform.interviewEpoch++;platform.tree=null;platform.exam=null;platform.interview=null;platform.skills=[];
   ['#profile-occupation','#profile-resume','#tree-major','#tree-occupation','#tree-jd','#interview-occupation','#interview-jd','#interview-answer','#voice-interim','#review-body','#admin-key'].forEach(s=>{const el=$(s);if(el){if('value'in el)el.value='';else el.textContent='';}});
   ['#tree-scene','#node-selection','#exam-questions','#exam-result','#wrongbook-list','#interview-history','#exam-history','#profile-materials','#profile-reports','#interview-messages','#admin-metrics','#admin-users','#admin-reviews','#admin-jobs','#review-list'].forEach(s=>$(s)?.replaceChildren());
@@ -5425,7 +6034,6 @@ function resetPlatform(){
   document.querySelectorAll('dialog[open]').forEach(d=>d.close());
 }
 let profileLoadEpoch=0,profileWipeEpoch=0;
-window.addEventListener('account-data-erased',()=>{profileLoadEpoch++;profileWipeEpoch++;});
 async function loadProfile(){
   const profileEpoch=++profileLoadEpoch;
   if(!platform.user)return;
@@ -5499,7 +6107,7 @@ function renderJobs(){
   const root=$('#job-list'),query=$('#job-search').value.trim().toLowerCase();root.replaceChildren();
   const jobs=platform.jobs.filter(j=>[j.title,j.company,j.description].join(' ').toLowerCase().includes(query));
   jobs.forEach(j=>{const card=node('article','panel job-card');card.append(node('span','badge '+(j.recommended?'green':'neutral'),j.recommended?'管理员推荐 · 待自行核验':'用户分享 · 未核验'),node('h3','',j.title),node('strong','',j.company),node('p','job-description',j.description),node('p','fine-print',`${j.rating===null?'暂无评分':j.rating+' / 5 分'} · ${j.review_count} 条点评`));
-    const row=node('div','button-row');row.append(button('用于职业规划',async()=>{await addText(j.description,'jd');$('#tree-occupation').value=j.title;$('#tree-jd').value=j.description;$('#interview-occupation').value=j.title;$('#interview-jd').value=j.description.slice(0,6000);show('career');toast('岗位已加入 JD 材料，可选择简历生成报告。');}),button('查看 / 写点评',()=>openReviews(j)));card.append(row);root.append(card);});
+    const row=node('div','button-row');row.append(button('用于职业规划',async()=>{await addText(j.description,'jd');$('#tree-occupation').value=j.title;$('#tree-jd').value=j.description;$('#interview-occupation').value=j.title;$('#interview-jd').value=j.description.slice(0,6000);show('career');toast('岗位已加入 JD 材料，可选择简历生成报告。');}),button('查看 / 写点评',()=>openReviews(j)));row.prepend(button('一键面试',()=>window.RecruitmentUI.open(j),'primary'));card.append(row);root.append(card);});
   if(!jobs.length)empty(root,'暂无匹配岗位。管理员可以添加推荐岗位，登录用户也可手动分享。');
 }
 async function publishJob(){
@@ -5548,7 +6156,7 @@ function renderConversation(history){
 }
 async function startInterview(){
   signed();consentChecked('#interview-consent');stopVoice();platform.interviewEpoch++;const epoch=platform.interviewEpoch;
-  const result=await api('/interviews',{method:'POST',data:{occupation:$('#interview-occupation').value.trim(),jd:$('#interview-jd').value.trim(),consent:true}});if(epoch!==platform.interviewEpoch||state.view!=='interview')return;
+  const result=await api('/interviews',{method:'POST',data:{occupation:$('#interview-occupation').value.trim(),jd:$('#interview-jd').value.trim(),consent:true,application_id:platform.applicationId}});if(epoch!==platform.interviewEpoch||state.view!=='interview')return;
   platform.interview=result;$('#interview-answer').value='';renderConversation(result.history);speakQuestion(result.question);
 }
 async function sendAnswer(){
@@ -5569,8 +6177,8 @@ function inheritCareer(result,jd){
 const platformHandlers={logout,'save-profile':saveProfile,'use-profile':useProfile,
   'refresh-profile':async()=>{signed();await loadProfile();},'generate-tree':generateTree,'load-trees':loadTrees,
   'submit-exam':submitExam,practice,'load-jobs':loadJobs,'publish-job':publishJob,'save-review':saveReview,
-  'start-interview':startInterview,'send-answer':sendAnswer,'end-interview':endInterview,listen,interrupt:()=>{stopVoice();text('#voice-status','已停止听写与朗读，文字仍可编辑。');},
-  'erase-learning':async()=>{signed();if(!confirm('删除当前账号的材料、档案、职业报告、技能树、考试、错题与面试记录？此操作不可恢复，已发布岗位和点评保留。'))return;stopVoice();platform.interviewEpoch++;await api('/profile/data',{method:'DELETE'});resetPlatform();window.dispatchEvent(new Event('account-data-erased'));await loadProfile();toast('个人档案和学习记录已删除。');}
+  'detach-application':()=>{platform.applicationId=null;platform.applicationJob=null;$('#interview-application-note').hidden=true;toast('已切换为个人练习；已有投递可在我的投递中撤回。');},'my-applications':()=>window.RecruitmentUI.mine(),'start-interview':startInterview,'send-answer':sendAnswer,'end-interview':endInterview,listen,interrupt:()=>{stopVoice();text('#voice-status','已停止听写与朗读，文字仍可编辑。');},
+  'erase-learning':async()=>{signed();if(!confirm('删除当前账号的头像、昵称、简介、材料、档案、职业报告、技能树、考试、错题与面试记录？此操作不可恢复，已发布岗位、点评与站内邮件保留；已投递的简历授权将撤回。'))return;stopVoice();platform.interviewEpoch++;await api('/profile/data',{method:'DELETE'});resetPlatform();window.dispatchEvent(new Event('account-data-erased'));await loadAccount();await loadProfile();toast('个人档案和学习记录已删除。');}
 };
 
 async function initPlatform(){
@@ -5595,6 +6203,7 @@ async function initPlatform(){
   $('#voice-consent').addEventListener('change',()=>{if(!$('#voice-consent').checked)stopVoice();});
   $('#interview-consent').addEventListener('change',()=>{if(!$('#interview-consent').checked){stopVoice();platform.interviewEpoch++;}});
   window.addEventListener('career-report',event=>inheritCareer(event.detail.result,event.detail.jd));
+  window.addEventListener('account-data-erased',()=>{profileLoadEpoch++;profileWipeEpoch++;});
   window.addEventListener('platform-clear',()=>{stopVoice();platform.interviewEpoch++;platform.interview=null;platform.skills=[];$('#tree-jd').value='';$('#interview-jd').value='';$('#interview-answer').value='';$('#interview-messages').replaceChildren();text('#career-tree-note','当前会话已清空，已保存学习记录可从个人中心重新打开。');});
   window.addEventListener('viewchange',event=>{if(event.detail!=='tree')platform.canvas?.cancel();if(event.detail!=='interview'){stopVoice();platform.interviewEpoch++;}const loaders={profile:async()=>{await loadAccount();await loadProfile();},tree:loadTrees,jobs:loadJobs};const load=loaders[event.detail];if(load&&!(event.detail==='profile'&&window.careerProfileFilling))load().catch(e=>toast(e.message,true));});
   window.addEventListener('pagehide',stopVoice);document.addEventListener('visibilitychange',()=>{if(document.hidden)stopVoice();});
@@ -6148,7 +6757,7 @@ input:not([type=checkbox]):not([type=radio]){width:100%;box-sizing:border-box;bo
 <link rel="stylesheet" href="/static/effects.css"><script src="/static/effects-core.js" defer></script><script src="/static/effects.js" defer></script>
 <link rel="stylesheet" href="/static/guide-assistant.css"><script src="/static/guide-core.js" defer></script><script type="module" src="/static/guide-assistant.js"></script>
 <link rel="stylesheet" href="/static/resume-studio.css"><script src="/static/resume-studio.js" defer></script><script src="/static/workspace-expansion.js" defer></script>
-<link rel="stylesheet" href="/static/assistant-chat.css"><script src="/static/assistant-chat.js" defer></script></head>
+<link rel="stylesheet" href="/static/assistant-chat.css"><script src="/static/assistant-chat.js" defer></script><link rel="stylesheet" href="/static/account-card.css"><script src="/static/account-card.js" defer></script><link rel="stylesheet" href="/static/recruitment-ui.css"><script src="/static/recruitment-ui.js" defer></script><link rel="stylesheet" href="/static/mail-ui.css"><script src="/static/mail-ui.js" defer></script><script src="/static/recruitment-bridge.js" defer></script></head>
 <body class="star-theme">
 <svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
 <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6Z"/><path d="m8 12 3 3 5-6"/></symbol>
@@ -6321,7 +6930,7 @@ if(document.body.dataset.page==='demo'){
 <!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>职安 · 管理控制台</title><link rel="icon" href="/static/mark.svg"><link rel="stylesheet" href="/static/styles.css"><link rel="stylesheet" href="/static/platform.css"><link rel="stylesheet" href="/static/admin.css"><script src="/static/portal.js" defer></script><script src="/static/admin-actions.js" defer></script><script src="/static/admin.js" defer></script><link rel="stylesheet" href="/static/theme.css">
 <link rel="stylesheet" href="/static/cinematic.css"><script src="/static/cinematic.js" defer></script>
 <link rel="stylesheet" href="/static/effects.css"><script src="/static/effects-core.js" defer></script><script src="/static/effects.js" defer></script>
-<link rel="stylesheet" href="/static/company.css"><script src="/static/company-admin.js" defer></script><script src="/static/model-settings.js" defer></script><script src="/static/admin-expansion.js" defer></script></head><body><aside class="admin-sidebar"><a class="admin-brand" href="/">职安 <small>ADMIN CONSOLE</small></a><span class="admin-caption">平台管理控制台</span><nav aria-label="管理导航"><a href="#view-admin">平台总览</a><a href="#admin-users">用户管理</a><a href="#admin-publish">推荐岗位</a><a href="#admin-reviews">点评管理</a><a href="#admin-security">内置安全与审计</a></nav><div class="admin-sidebar-foot"><a href="/app">前往求职工作台 ↗</a><a href="/">返回首页 ↗</a><button id="admin-logout">退出登录</button></div></aside><div class="admin-shell"><header class="admin-top"><span>管理后台 / 独立控制台</span><span id="admin-identity">正在验证管理员…</span></header><main id="admin-main"><p id="admin-loading">正在载入平台数据…</p></main></div><div id="toast" class="toast" role="status" hidden></div></body></html>
+<link rel="stylesheet" href="/static/company.css"><script src="/static/company-admin.js" defer></script><script src="/static/model-settings.js" defer></script><script src="/static/admin-pages.js" defer></script><link rel="stylesheet" href="/static/mail-ui.css"><script src="/static/mail-ui.js" defer></script><script src="/static/admin-expansion.js" defer></script></head><body><aside class="admin-sidebar"><a class="admin-brand" href="/">职安 <small>ADMIN CONSOLE</small></a><span class="admin-caption">平台管理控制台</span><nav aria-label="管理导航"><a href="/admin?page=overview">平台总览</a><a href="/admin?page=users">用户管理</a><a href="/admin?page=jobs">岗位审核与推荐</a><a href="/admin?page=reviews">点评管理</a><a href="/admin?page=companies">企业材料审核</a><a href="/admin?page=models">AI 模型设置</a><a href="/admin?page=knowledge">共享知识库</a><a href="/admin?page=security">安全与审计</a><a href="/admin?page=mail">邮件与通知</a></nav><div class="admin-sidebar-foot"><a href="/app">前往求职工作台 ↗</a><a href="/">返回首页 ↗</a><button id="admin-logout">退出登录</button></div></aside><div class="admin-shell"><header class="admin-top"><span id="admin-breadcrumb">管理后台 / 平台总览</span><span id="admin-identity">正在验证管理员…</span></header><main id="admin-main" aria-busy="true"><p id="admin-loading">正在载入平台数据…</p></main></div><div id="toast" class="toast" role="status" hidden></div></body></html>
 ```
 
 ### `static/admin.css`
@@ -6331,6 +6940,49 @@ if(document.body.dataset.page==='demo'){
 @media(max-width:750px){.admin-sidebar{position:relative;width:100%;padding:20px}.admin-brand{font-size:23px}.admin-brand small{display:inline;font-size:7px;margin-left:10px}.admin-caption{display:none}.admin-sidebar nav{display:flex;overflow:auto;gap:5px;margin-top:18px}.admin-sidebar nav a{white-space:nowrap;padding:8px 12px;font-size:11px}.admin-sidebar-foot{display:flex;flex-wrap:wrap;gap:20px;padding:15px 10px 0;margin:0}.admin-shell{margin:0}.admin-top{height:55px;padding:0 20px;font-size:10px}.admin-shell main{padding:25px 18px}.admin-surface>.page-heading h1{font-size:24px}.admin-shell .toast{left:50%}}
 
 #admin-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}#admin-metrics .panel{padding:21px}#admin-metrics .metric-value{font-size:29px}@media(max-width:1100px){#admin-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:750px){#admin-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}#admin-metrics .panel{padding:18px}}
+/* Admin pages share the site's glass, particle and meteor effect layer. */
+.admin-sidebar{width:248px;padding:27px 18px;overflow-y:auto;overscroll-behavior:contain;border-right:1px solid #83c8ff40}
+.admin-brand{padding:0 15px;color:#dceaff;text-shadow:0 0 28px #7dbaff65}
+.admin-caption{margin:28px 15px 12px;color:#91a7cb}
+.admin-sidebar nav{gap:5px}
+.admin-sidebar nav a{display:flex;align-items:center;gap:11px;min-height:46px;padding:9px 12px;color:#adbeda;border:1px solid transparent;border-radius:12px;font-size:12px}
+.admin-sidebar nav a:hover{background:#6e9bff16;color:#e6f2ff;border-color:#95c7ff35}
+.admin-sidebar nav a.active{background:linear-gradient(115deg,#67a7fa30,#ac81fa1c);color:#eef7ff;border-color:#91c6ff60;box-shadow:inset 2px 0 #8ad6ff,0 0 23px #669af725}
+.admin-sidebar nav a svg{height:29px;width:29px;flex:none}
+.admin-sidebar-foot{padding:24px 14px 0;gap:14px;font-size:11px}
+.admin-shell{margin-left:248px;min-height:100dvh}
+.admin-top{min-height:77px;height:auto;gap:18px;padding:20px 38px;flex-wrap:wrap}
+.admin-shell main{max-width:1600px;margin:0 auto;padding:35px 38px 60px}
+.admin-page{min-width:0}
+.admin-page[hidden],[data-admin-page][hidden]{display:none!important}
+.admin-surface>.page-heading{margin-bottom:28px;gap:22px}
+.admin-surface>.page-heading h1{font-size:clamp(24px,2.7vw,34px);line-height:1.35;letter-spacing:-.6px;color:#e1edff;text-shadow:0 0 35px #9bcaff30}
+#admin-page-title:focus{outline:none}
+.admin-surface>.page-heading p{max-width:680px;line-height:1.9;color:#a8b9d7}
+.admin-page>.panel:first-child{margin-top:0}
+.admin-page .two-col{grid-template-columns:minmax(0,1fr)}
+#admin-ai-settings:not([hidden]){display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;align-items:start}
+#admin-ai-settings>.panel{margin:0;min-width:0}
+#admin-ai-settings>[data-admin-page=knowledge]{grid-column:1/-1}
+.admin-security{border:0;padding:0;margin:0}
+.admin-security>.page-heading{display:none}
+.admin-security .two-col{grid-template-columns:repeat(2,minmax(0,1fr))}
+.admin-row{gap:16px;min-width:0;flex-wrap:wrap}
+.admin-row>div:first-child{flex:1 1 360px;min-width:0}
+.admin-row p,.admin-row strong{overflow-wrap:anywhere}
+.admin-page .button,.admin-security .button{min-height:40px}
+.admin-page .panel h3,.admin-security h3{color:#dceaff}
+.admin-page .field input,.admin-page .field textarea,.admin-page .field select{max-width:100%;min-width:0}
+.admin-page .two-col.spaced{margin-top:22px}
+#admin-mail-settings:empty,#admin-mail-content:empty{display:none}
+#admin-mail-content{margin-top:24px}
+@media(min-width:751px){.admin-sidebar{height:100dvh}.admin-sidebar-foot{margin-top:auto}.admin-top{position:relative;z-index:2}}
+@media(max-width:1050px){#admin-ai-settings:not([hidden]),.admin-security .two-col{grid-template-columns:minmax(0,1fr)}.admin-shell main{padding:28px 24px 45px}.admin-top{padding:20px 24px}}
+@media(max-width:750px){.admin-sidebar{width:100%;padding:18px;overflow:visible}.admin-brand{padding:0 4px}.admin-sidebar nav{display:flex;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin;padding:0 0 7px}.admin-sidebar nav a{min-height:44px;flex-shrink:0;gap:6px;padding:7px 10px;font-size:11px}.admin-sidebar nav a svg{height:25px;width:25px}.admin-sidebar-foot{display:flex;gap:18px;padding:12px 4px 0}.admin-shell{margin-left:0}.admin-top{padding:16px 20px;gap:10px;font-size:10px}.admin-shell main{padding:24px 18px 40px}.admin-surface>.page-heading{align-items:flex-start;flex-wrap:wrap;margin-bottom:24px}.admin-row>div:first-child{flex-basis:100%}}
+
+/* Keep the pre-mount legacy fragments from flashing as a long page. */
+.admin-shell main[aria-busy="true"] #view-admin{visibility:hidden}
+.admin-shell main[aria-busy="true"]:before{content:"正在载入管理页面…";display:block;color:#9baecc;font-size:13px;padding:24px 0}
 ```
 
 ### `static/admin.js`
@@ -6369,7 +7021,7 @@ async function init(){
   $('#injection-sample').addEventListener('change',e=>$('#injection-text').value=injectionSamples[e.target.value]);
   // 清空访客缓存是前台的数据操作，不在后台提供同名按钮。
   document.querySelectorAll('#admin-security [data-action=clear]').forEach(b=>b.remove());
-  document.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const handlers={'load-admin':loadAdmin,'save-model':saveModel,'test-model':testModel,'refresh-audit':refreshAudit,'check-injection':checkInjection};const fn=handlers[b.dataset.platform||b.dataset.action];if(fn)run(fn,b);if(b.dataset.go==='jobs')$('#admin-publish').scrollIntoView({behavior:'smooth'});});
+  document.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const handlers={'load-admin':loadAdmin,'save-model':saveModel,'test-model':testModel,'refresh-audit':refreshAudit,'check-injection':checkInjection};const fn=handlers[b.dataset.platform||b.dataset.action];if(fn)run(fn,b);if(b.dataset.go==='jobs'){window.AdminPages?.go('jobs');$('#admin-job-title').focus();}});
   await loadAdmin();
   window.CareerGuardAdminReady=true;
   document.dispatchEvent(new CustomEvent('admin-loaded'));
@@ -6385,12 +7037,12 @@ async function loadAdmin(){
   signed();if(platform.user.role!=='admin')throw Error('仅管理员可访问后台。');
   const [data,model,jobs]=await Promise.all([api('/admin/overview'),api('/admin/model'),api('/admin/jobs')]);
   await refreshAudit();
-  const metrics=$('#admin-metrics');metrics.replaceChildren();const labels={users:'注册用户',jobs:'发布岗位',reviews:'岗位点评',trees:'生成路线',exams:'技能练习',interviews:'面试会话',active_users_today:'今日活跃用户'};
+  const metrics=$('#admin-metrics');metrics.replaceChildren();const labels={users:'注册用户',jobs:'发布岗位',reviews:'岗位点评',trees:'生成路线',exams:'技能练习',interviews:'面试会话',active_users_today:'今日活跃用户',companies:'入驻企业',mail_messages:'站内邮件',active_applications:'有效岗位投递'};
   Object.entries(data.totals).forEach(([key,count])=>{const card=node('article','panel');card.append(node('p','fine-print',labels[key]||key),node('strong','metric-value',count));metrics.append(card);});
   $('#admin-provider').value=model.provider;$('#admin-model').value=model.model;$('#admin-key').value='';text('#admin-key-status',model.has_key?'已有服务端密钥，页面不显示原值。':'尚未配置云端密钥。');
   const a=$('#admin-activity');a.replaceChildren();data.activity.forEach(x=>a.append(node('div','admin-row',`${x.action} · ${x.count} 次`)));
   const daily=$('#admin-daily');daily.replaceChildren();data.daily.forEach(x=>daily.append(node('div','admin-row',`${x.day} · ${x.count} 次操作`)));
-  const users=$('#admin-users');users.replaceChildren();data.users.forEach(u=>{const row=node('div','admin-row');row.append(node('span','',`${u.username} · ${u.role==='admin'?'管理员':'用户'} · ${u.disabled?'已停用':'正常'}`));if(u.id!==platform.user.id)row.append(button(u.disabled?'启用账号':'停用账号',async()=>{await api('/admin/users/'+u.id,{method:'PATCH',data:{disabled:!u.disabled}});await loadAdmin();}));users.append(row);});
+  const users=$('#admin-users');users.replaceChildren();data.users.forEach(u=>{const row=node('div','admin-row');row.append(node('span','',`${u.username} · ${u.role==='admin'?'管理员':u.role==='company'?'企业管理员':'用户'} · ${u.disabled?'已停用':'正常'}`));if(u.id!==platform.user.id)row.append(button(u.disabled?'启用账号':'停用账号',async()=>{await api('/admin/users/'+u.id,{method:'PATCH',data:{disabled:!u.disabled}});await loadAdmin();}));if(u.id!==platform.user.id)row.append(button('发送通知',async()=>{window.AdminPages.go('mail');await window.CareerMail.compose({recipient_id:u.id,subject:'平台通知'});}));users.append(row);});
   const reviews=$('#admin-reviews');reviews.replaceChildren();data.reviews.forEach(r=>{const row=node('div','admin-row'),content=node('div');content.append(node('strong','',`${r.company} · ${r.title} · ${r.rating} 分`),node('p','',r.body));row.append(content,button(r.hidden?'恢复公开':'隐藏点评',async()=>{await api('/admin/reviews/'+r.id,{method:'PATCH',data:{hidden:!r.hidden}});await loadAdmin();}));reviews.append(row);});
   const list=$('#admin-jobs');list.replaceChildren();jobs.items.forEach(j=>{
     const row=node('div','admin-row'),content=node('div');content.append(node('strong','',`${j.company} · ${j.title}`),node('p','',j.description),node('p','fine-print',`${j.publisher} · ${{pending:'待审核',approved:'已通过',rejected:'未通过'}[j.status]}`));
@@ -6687,33 +7339,32 @@ window.CameraAssist=(()=>{
   async function mount(){
     if(mounted||!window.CareerGuardAdminReady)return;
     mounted=true;
-    const root=document.querySelector('#view-admin');
-    if(!root)return;
-    // Retain the legacy DOM because overview refresh still updates these fields.
+    const root=document.querySelector('#view-admin');if(!root)return;
     const legacy=document.querySelector('#admin-provider')?.closest('article');
-    if(legacy){legacy.hidden=true;legacy.setAttribute('aria-hidden','true');if(legacy.parentElement?.classList.contains('two-col'))legacy.parentElement.style.gridTemplateColumns='minmax(0,1fr)';}
-    const section=(id,title,description)=>{
-      const article=document.createElement('section');article.id=id;article.className='panel spaced';
-      const heading=document.createElement('h2');heading.textContent=title;
-      const intro=document.createElement('p');intro.className='fine-print';intro.textContent=description;
-      const body=document.createElement('div');article.append(heading,intro,body);
-      root.insertBefore(article,document.querySelector('#admin-security'));
-      const link=document.createElement('a');link.href='#'+id;link.textContent=title;document.querySelector('.admin-sidebar nav')?.append(link);
-      return body;
-    };
-    const company=section('admin-companies','企业材料审核','查看原件，核对企业信息；材料通过后企业可提交待审岗位。');
-    const models=section('admin-ai-settings','AI模型与知识库','分别配置对话、Embedding与图片模型；保存配置不会自动连接。');
-    async function load(component,container){
-      try{if(!component)throw Error('管理组件未加载，请刷新页面。');await component.init(container);}
-      catch(error){const message=document.createElement('p');message.textContent=error.message;message.setAttribute('role','status');container.append(message);}
-    }
-    // ModelSettingsUI uses the existing admin node/api/toast helpers, whose
-    // signatures already match its UI adapter. Do not redeclare global helpers.
-    await Promise.allSettled([load(window.CompanyAdminUI,company),load(window.ModelSettingsUI,models)]);
-    if(location.hash==='#admin-companies'||location.hash==='#admin-ai-settings')document.querySelector(location.hash)?.scrollIntoView({behavior:'auto'});
+    if(legacy){legacy.hidden=true;legacy.setAttribute('aria-hidden','true');}
+    const heading=root.querySelector('.page-heading');
+    heading.querySelector('h1').id='admin-page-title';heading.querySelector('h1').tabIndex=-1;
+    heading.querySelector('.eyebrow').id='admin-page-eyebrow';heading.querySelector('p').id='admin-page-description';
+    const page=(id,route,...children)=>{const section=document.createElement('section');section.id=id;section.className='admin-page';section.dataset.adminPage=route;section.setAttribute('aria-labelledby','admin-page-title');section.hidden=true;section.append(...children);root.append(section);return section;};
+    page('admin-overview-page','overview',document.querySelector('#admin-metrics'),document.querySelector('#admin-activity').closest('.two-col'));
+    page('admin-users-page','users',document.querySelector('#admin-users').closest('article'));
+    page('admin-jobs-page','jobs',document.querySelector('#admin-jobs').closest('article'),document.querySelector('#admin-publish'));
+    page('admin-reviews-page','reviews',document.querySelector('#admin-reviews').closest('article'));
+    document.querySelector('#admin-security').dataset.adminPage='security';
+    const company=page('admin-companies','companies');
+    // Keep a shared host: ModelSettingsUI checks container.contains(kb) on refresh.
+    const models=page('admin-ai-settings','models knowledge');
+    const mail=page('admin-mail','mail'),mailSettings=document.createElement('div'),mailBody=document.createElement('div');mailSettings.id='admin-mail-settings';mailBody.id='admin-mail-content';mailSettings.className='panel spaced';mailBody.className='panel spaced';mail.append(mailSettings,mailBody);
+    window.AdminPages.init();
+    async function load(component,container){try{if(!component)throw Error('管理组件未加载，请刷新页面。');await component.init(container);}catch(error){const message=document.createElement('p');message.className='panel';message.textContent=error.message;message.setAttribute('role','status');container.append(message);}}
+    const splitModels=()=>{Array.from(models.children).filter(el=>el.tagName==='ARTICLE').forEach((card,index)=>{card.dataset.adminPage=index<3?'models':'knowledge';});window.AdminPages.refresh();};
+    // Tag cards while the asynchronous component mounts, so another page never flashes.
+    const observer=new MutationObserver(splitModels);observer.observe(models,{childList:true});
+    const modelLoad=load(window.ModelSettingsUI,models).finally(()=>{observer.disconnect();splitModels();});
+    await Promise.allSettled([load(window.CompanyAdminUI,company),modelLoad,load(window.MailAdminUI,mailSettings),load(window.MailUI||window.CareerMail,mailBody)]);
+    window.AdminPages.refresh();document.dispatchEvent(new CustomEvent('admin-pages-ready'));
   }
-  document.addEventListener('admin-loaded',mount);
-  if(window.CareerGuardAdminReady)mount();
+  document.addEventListener('admin-loaded',mount);if(window.CareerGuardAdminReady)mount();
 })();
 ```
 
@@ -6740,7 +7391,7 @@ window.CameraAssist=(()=>{
       refresh.disabled=true;message.textContent='正在读取企业材料…';
       try{csrf=(await call('/auth/session')).csrf_token;const {items}=await call('/admin/companies');list.replaceChildren();if(!items.length)list.append(node('p','暂无企业材料。'));
         for(const company of items){
-          const card=node('article');card.className='company-card';const heading=node('h3',company.name),badge=node('span',status[company.status]||company.status);badge.className='company-badge';card.append(heading,badge,node('p','统一社会信用代码：'+company.credit_code),node('p','联系人职务：'+company.contact_role),node('p','提交时间：'+company.created));
+          const card=node('article');card.className='company-card panel';const heading=node('h3',company.name),badge=node('span',status[company.status]||company.status);badge.className='company-badge';card.append(heading,badge,node('p','统一社会信用代码：'+company.credit_code),node('p','联系人职务：'+company.contact_role),node('p','提交时间：'+company.created));
           const notes=company.ocr_notes;card.append(node('p',notes.message),node('p','名称文字匹配：'+(notes.name_match===null?'未识别':notes.name_match?'一致':'未找到一致文字')+'；信用代码文字匹配：'+(notes.credit_code_match===null?'未识别':notes.credit_code_match?'一致':'未找到一致文字')));
           if(notes.detected_name)card.append(node('p','OCR名称候选：'+notes.detected_name));if(notes.detected_credit_codes?.length)card.append(node('p','OCR代码候选：'+notes.detected_credit_codes.join(' / ')));
           const original=node('a','查看营业执照原件');original.href='/api/admin/companies/'+company.id+'/license';original.target='_blank';original.rel='noopener';const download=node('a',' 下载原件');download.href=original.href;download.download='license-'+company.id;card.append(original,download);
@@ -6757,7 +7408,7 @@ window.CameraAssist=(()=>{
 ### `static/company-console.html`
 
 ```html
-<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>企业工作台 · 职安</title><link rel="icon" href="/static/mark.svg"><link rel="stylesheet" href="/static/portal.css"><link rel="stylesheet" href="/static/theme.css"><link rel="stylesheet" href="/static/cinematic.css"><link rel="stylesheet" href="/static/effects.css"><link rel="stylesheet" href="/static/company.css"><script src="/static/effects-core.js" defer></script><script src="/static/effects.js" defer></script><script src="/static/company.js" defer></script></head><body data-company-page="console"><header class="site-header"><a class="site-brand" href="/">职安 <small>企业工作台</small></a><nav><button id="company-refresh" type="button">刷新状态</button> <button id="company-logout" type="button">退出登录</button></nav></header><main class="company-shell"><span class="company-kicker">EMPLOYER CONSOLE</span><h1>连接人才，<br><span class="spectrum-text">从真实开始。</span></h1><p id="company-message" role="status" aria-live="polite">正在读取企业审核状态…</p><section id="company-info" class="company-card" aria-label="企业审核状态"></section><section class="company-card"><h2 id="company-job-heading">提交招聘岗位</h2><p>企业材料通过后可提交岗位；每次编辑都会重新进入岗位审核。</p><form id="company-job-form"><fieldset id="company-job-fields" disabled><label>岗位名称<input name="title" required maxlength="160"></label><label>岗位说明<textarea name="description" required maxlength="12000" rows="7" placeholder="职责、要求、地点、薪资范围及招聘安排"></textarea></label><button class="pill dark" type="submit">提交岗位审核</button> <button id="company-job-cancel" type="button" hidden>取消编辑</button></fieldset></form></section><section class="company-card"><h2>本企业岗位</h2><div id="company-jobs">正在读取…</div></section></main></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>企业招聘中心 · 职安</title><link rel="icon" href="/static/mark.svg"><link rel="stylesheet" href="/static/portal.css"><link rel="stylesheet" href="/static/theme.css"><link rel="stylesheet" href="/static/company.css"><link rel="stylesheet" href="/static/cinematic.css"><link rel="stylesheet" href="/static/effects.css"><link rel="stylesheet" href="/static/mail-ui.css"><script src="/static/effects-core.js" defer></script><script src="/static/effects.js" defer></script><script src="/static/mail-ui.js" defer></script><script src="/static/company.js" defer></script></head><body data-company-page="console"><aside class="company-sidebar"><a class="site-brand" href="/">职安 <small>企业招聘中心</small></a><p class="company-kicker">EMPLOYER WORKSPACE</p><nav aria-label="企业工作台"><a href="/company/overview" data-company-nav="overview"><span class="nav-orbit"></span>企业概览</a><a href="/company/jobs" data-company-nav="jobs"><span class="nav-orbit"></span>岗位管理</a><a href="/company/publish" data-company-nav="publish"><span class="nav-orbit"></span>发布岗位</a><a href="/company/candidates" data-company-nav="candidates"><span class="nav-orbit"></span>授权候选人</a><a href="/company/mail" data-company-nav="mail"><span class="nav-orbit"></span>招聘站内信</a></nav><p class="company-sidebar-note">从真实信息开始，<br>让每一次连接更有依据。</p><button id="company-logout" type="button">退出登录</button></aside><main class="company-shell company-workspace"><header class="company-topbar"><span class="company-kicker">CAREER GUARD / RECRUITMENT</span><button id="company-refresh" type="button">刷新</button></header><h1 id="company-page-title">企业概览</h1><p id="company-message" role="status" aria-live="polite">正在读取企业审核状态…</p><section data-company-view="overview"><div class="company-metrics" id="company-metrics"></div><section class="company-card panel" aria-label="企业审核状态"><div id="company-info"></div></section></section><section data-company-view="jobs" hidden><section class="company-card panel"><h2>本企业岗位</h2><p>投递人数仅包含仍有效的主动授权；面试人数按实际创建的岗位面试去重统计。</p><div id="company-jobs">正在读取…</div></section></section><section data-company-view="publish" hidden><section class="company-card panel"><h2 id="company-job-heading">提交招聘岗位</h2><p>企业材料通过后可提交岗位；每次编辑都会重新进入岗位审核。</p><form id="company-job-form"><fieldset id="company-job-fields" disabled><label>岗位名称<input name="title" required maxlength="160"></label><label>岗位说明<textarea name="description" required maxlength="12000" rows="9" placeholder="职责、要求、地点、薪资范围及招聘安排"></textarea></label><button class="pill dark" type="submit">提交岗位审核</button> <button id="company-job-cancel" type="button" hidden>取消编辑</button></fieldset></form></section></section><section data-company-view="candidates" hidden><section class="company-card panel"><h2>主动授权的候选人</h2><p>仅显示主动投递本企业岗位的简历快照。候选人撤回后不再可见。</p><label>按岗位筛选<select id="company-candidate-filter"><option value="">全部岗位</option></select></label><div id="company-candidates"></div></section></section><section data-company-view="mail" hidden><section class="company-card panel"><h2>招聘站内信</h2><p>与主动投递本企业岗位的求职者沟通意向。</p><button id="company-open-mail" type="button">打开站内信</button><div id="company-mail-host"></div></section></section></main></body></html>
 ```
 
 ### `static/company-register.html`
@@ -6771,45 +7422,29 @@ window.CameraAssist=(()=>{
 
 ```css
 .company-shell{max-width:1000px;margin:65px auto;padding:20px 24px 100px}.company-kicker{font-size:12px;letter-spacing:.2em;color:#9db7e5}.company-shell h1{font-size:clamp(38px,7vw,72px);line-height:1.12;letter-spacing:-.05em;margin:20px 0 25px}.company-shell p{line-height:1.8;color:#aeb8cc}.company-card{margin:28px 0;padding:30px;border:1px solid #ffffff20;border-radius:24px;background:linear-gradient(140deg,#141e30ed,#090e18f0);box-shadow:0 20px 70px #0003}.company-card h2{margin:0 0 20px;font-size:23px}.company-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}.company-card label{display:flex;flex-direction:column;gap:10px;margin-bottom:20px;color:#dde4f2}.company-card input:not([type=checkbox]),.company-card textarea{box-sizing:border-box;width:100%;padding:13px 15px;border:1px solid #ffffff29;border-radius:12px;background:#070b15;color:#eef4ff;font:inherit;min-width:0}.company-card input:focus,.company-card textarea:focus{outline:2px solid #99bdff;outline-offset:2px}.company-card small{color:#a6b2c8;font-size:12px;line-height:1.6}.company-card .company-check{display:flex;flex-direction:row;align-items:flex-start;line-height:1.8}.company-check input{margin-top:8px;flex-shrink:0}.company-notice{padding:16px;border-left:2px solid #92b4f2;background:#96b8ff0a;font-size:13px}.company-card button,.company-shell button{cursor:pointer;padding:10px 17px;border:1px solid #ffffff30;border-radius:20px;background:#17243a;color:#eef4ff;font:inherit}.company-card button:disabled{opacity:.45;cursor:wait}.company-card fieldset{padding:0;margin:0;border:0;min-width:0}.company-job{border-top:1px solid #ffffff20;padding:22px 0;overflow-wrap:anywhere}.company-job h3{margin:0 0 10px}.company-job p{white-space:pre-wrap}.company-job button{margin:5px}.company-badge{display:inline-block;border:1px solid #809dce55;color:#bdd5fc;border-radius:99px;padding:4px 12px;font-size:13px}.company-error{color:#ffb6b6!important}.company-admin-list{max-width:100%}.company-admin-list textarea{display:block;width:100%;margin:15px 0}.company-admin-list a,.company-shell a{color:#bdd5fc}.company-card pre{white-space:pre-wrap;overflow-wrap:anywhere;color:#b7c9e8;font:inherit;font-size:13px}.company-card :focus-visible{outline:2px solid #a5c5ff;outline-offset:3px}@media(max-width:640px){.company-grid{grid-template-columns:1fr}.company-shell{margin-top:30px;padding:16px}.company-card{padding:21px}.site-header nav{font-size:12px}}
+body[data-company-page=console]{background:radial-gradient(ellipse at 80% 0,#24385855,transparent 48%),#080e19;color:#e6edfa}.company-sidebar{position:fixed;inset:0 auto 0 0;width:245px;box-sizing:border-box;padding:35px 24px;background:#0a1221;border-right:1px solid #ffffff14;display:flex;flex-direction:column;z-index:20}.company-sidebar .site-brand{font-size:24px;text-decoration:none;color:#f1f6ff}.company-sidebar .site-brand small{display:block;font-size:11px;letter-spacing:.12em;color:#8fa3c3;margin-top:8px}.company-sidebar .company-kicker{font-size:9px;margin:42px 0 18px;color:#778eaf}.company-sidebar nav{display:grid;gap:10px}.company-sidebar nav a{display:flex;gap:14px;align-items:center;text-decoration:none;color:#93a6c3;padding:12px;border-radius:12px;font-size:14px}.company-sidebar nav a.active{background:linear-gradient(90deg,#29466b88,#28456c22);color:#e4eeff}.nav-orbit{display:grid;place-items:center;width:29px;height:29px;border:1px solid #738fb940;border-radius:9px;color:#9cc4ff;box-shadow:inset 0 0 14px #719eee12,0 0 18px #7bacff10;transition:transform .2s,box-shadow .2s}.company-sidebar a:hover .nav-orbit{transform:translateY(-2px);box-shadow:0 0 20px #76a6ff44}.company-sidebar-note{margin-top:auto;color:#70829d;font-size:12px;line-height:1.8}.company-sidebar button{padding:10px;border:1px solid #ffffff20;border-radius:10px;background:#172238;color:#c6d6f0;cursor:pointer}.company-workspace{max-width:1100px;margin:0 0 0 245px;padding:35px 48px 100px}.company-workspace h1{font-size:40px;margin-top:45px}.company-topbar{display:flex;align-items:center;justify-content:space-between;gap:20px}.company-topbar .company-kicker{font-size:10px}.company-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-top:30px}.company-metric{padding:25px;border:1px solid #a3bdeb22;border-radius:20px;background:linear-gradient(135deg,#1a2b42,#101827)}.company-metric strong{display:block;font-size:36px;font-weight:500;color:#d1e4ff;margin-bottom:10px}.company-metric span{font-size:13px;color:#8fa6c6}.company-workspace select{padding:12px;border:1px solid #ffffff25;border-radius:12px;background:#0b1425;color:#e4edff;font:inherit}.company-workspace details{margin:20px 0}.company-workspace summary{cursor:pointer;color:#bcd6ff}.company-workspace pre{padding:20px;background:#070d17;border-radius:14px}.company-workspace [hidden]{display:none!important}.company-workspace .company-card{background:linear-gradient(140deg,#152033dd,#0c1422ed)}@media(max-width:900px){.company-sidebar{width:200px;padding:28px 16px}.company-workspace{margin-left:200px;padding:28px}.company-metrics{gap:10px}.company-metric{padding:18px}}@media(max-width:640px){.company-sidebar{position:relative;width:auto;padding:20px;border-right:0;border-bottom:1px solid #ffffff14}.company-sidebar .company-kicker,.company-sidebar-note{display:none}.company-sidebar .site-brand small{display:inline;margin-left:12px}.company-sidebar nav{display:flex;overflow:auto;gap:4px;margin-top:20px}.company-sidebar nav a{flex-shrink:0;padding:8px;font-size:12px;gap:6px}.company-sidebar>button{position:absolute;top:18px;right:18px;font-size:11px}.nav-orbit{width:22px;height:22px}.company-workspace{margin:0;padding:22px 16px 70px}.company-workspace h1{font-size:32px;margin-top:30px}.company-metrics{grid-template-columns:repeat(3,1fr)}.company-metric{padding:16px 10px}.company-metric strong{font-size:28px}.company-metric span{font-size:11px}}@media(prefers-reduced-motion:reduce){.nav-orbit{transition:none}.company-sidebar a:hover .nav-orbit{transform:none}}
+/* Company surfaces share the existing glass-icon atlas and card effects. */
+.company-workspace{position:relative;z-index:1}.company-card,.company-metric{position:relative;overflow:hidden;isolation:isolate}.company-sidebar .site-brand{display:grid;grid-template-columns:44px 1fr;align-items:center;column-gap:10px}.company-sidebar .site-brand>svg{grid-row:1/3;width:43px;height:45px}.company-sidebar .site-brand small{grid-column:2;margin-top:0;font-size:10px;letter-spacing:.03em}.company-sidebar .nav-orbit{width:36px;height:36px;flex-shrink:0;background:#13284250;border-color:#87b7ed33}.company-sidebar .nav-orbit svg{width:33px;height:33px}.company-sidebar a.active .nav-orbit svg{filter:drop-shadow(0 0 8px #72c9ff78)}@media(max-width:640px){.company-sidebar .site-brand{display:flex;width:max-content;gap:7px}.company-sidebar .site-brand>svg{width:32px;height:34px}.company-sidebar .site-brand small{display:none}.company-sidebar .nav-orbit{width:29px;height:29px}.company-sidebar .nav-orbit svg{width:28px;height:28px}}
 ```
 
 ### `static/company.js`
 
 ```javascript
 (() => {
-  'use strict';
-  let csrf='',editing=null,company=null;
-  const $=s=>document.querySelector(s);
-  const status={pending:'待平台审核',approved:'平台材料审核通过',rejected:'材料已退回'};
-  function el(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;}
-  function message(text,error=false){$('#company-message').textContent=text;$('#company-message').classList.toggle('company-error',error);}
-  async function api(path,method='GET',data){const options={method,credentials:'same-origin',headers:{'X-CSRF-Token':csrf}};if(data instanceof FormData)options.body=data;else if(data){options.headers['Content-Type']='application/json';options.body=JSON.stringify(data);}const r=await fetch('/api'+path,options);const result=await r.json();if(!r.ok)throw new Error(typeof result.detail==='string'?result.detail:'请求未完成，请重试。');if(result.csrf_token)csrf=result.csrf_token;return result;}
-  function reset(){editing=null;$('#company-job-form').reset();$('#company-job-heading').textContent='提交招聘岗位';$('#company-job-cancel').hidden=true;}
-  async function refresh(){
-    const result=await api('/company/me');company=result.company;
-    const info=$('#company-info');info.replaceChildren(el('h2',company.name),el('span',status[company.status]||company.status,'company-badge'),el('p','统一社会信用代码：'+company.credit_code),el('p','联系人职务：'+company.contact_role),el('p',company.review_note?'审核意见：'+company.review_note:'提交材料后，请等待平台人工审核。'),el('p',company.ocr_notes.message));
-    info.append(el('p','此状态仅代表平台材料审核，不是政府真实性认证。','company-notice'));
-    const original=el('a','查看已提交营业执照');original.href=company.license_url;original.target='_blank';original.rel='noopener';info.append(original);
-    $('#company-job-fields').disabled=company.status!=='approved';
-    message(company.status==='approved'?'企业材料已通过，可以提交岗位审核。':'当前暂不能提交或编辑岗位，您仍可下架已有岗位。');
-    const {items}=await api('/company/jobs'),list=$('#company-jobs');list.replaceChildren();
-    if(!items.length)list.append(el('p','还没有岗位。'));
-    for(const job of items){const card=el('article',undefined,'company-job');card.append(el('h3',job.title),el('span',job.active?({pending:'岗位待审核',approved:'岗位已公开',rejected:'岗位已退回'}[job.status]||job.status):'已下架','company-badge'),el('p',job.description));if(job.review_note)card.append(el('p','岗位审核意见：'+job.review_note));const edit=el('button','编辑并重新送审');edit.type='button';edit.disabled=company.status!=='approved';edit.onclick=()=>{editing=job.id;const f=$('#company-job-form');f.elements.title.value=job.title;f.elements.description.value=job.description;$('#company-job-heading').textContent='编辑岗位 · 重新审核';$('#company-job-cancel').hidden=false;f.scrollIntoView({behavior:'auto',block:'center'});f.elements.title.focus();};card.append(edit);if(job.active){const down=el('button','下架');down.type='button';down.onclick=async()=>{down.disabled=true;try{await api('/company/jobs/'+job.id,'DELETE');await refresh();}catch(e){message(e.message,true);down.disabled=false;}};card.append(down);}list.append(card);}
-  }
-  async function start(){
-    const session=await api('/auth/session');csrf=session.csrf_token;
-    if(document.body.dataset.companyPage==='register'){
-      $('#company-register').addEventListener('submit',async ev=>{ev.preventDefault();const form=ev.currentTarget,button=form.querySelector('button[type=submit]'),file=form.elements.license.files[0];if(!file||file.size>8*1024*1024){message('请上传不超过8MB的营业执照。',true);return;}button.disabled=true;message('正在校验并提交材料，请稍候…');try{await api('/company/register','POST',new FormData(form));location.assign('/company');}catch(e){message(e.message,true);button.disabled=false;}});
-      return;
-    }
-    const {user}=await api('/auth/me');if(!user){location.replace('/login?next=company');return;}if(user.role!=='company'){message('当前账号不是企业账号，请使用企业管理员账号登录。',true);return;}
-    $('#company-refresh').onclick=()=>refresh().catch(e=>message(e.message,true));
-    $('#company-logout').onclick=async()=>{try{await api('/auth/logout','POST');location.assign('/login');}catch(e){message(e.message,true);}};
-    $('#company-job-cancel').onclick=reset;
-    $('#company-job-form').onsubmit=async ev=>{ev.preventDefault();const form=ev.currentTarget,button=form.querySelector('[type=submit]');button.disabled=true;try{await api('/company/jobs'+(editing?'/'+editing:''),editing?'PUT':'POST',{title:form.elements.title.value,description:form.elements.description.value});reset();await refresh();message('岗位已提交，等待网站管理员审核后公开。');}catch(e){message(e.message,true);}finally{button.disabled=false;}};
-    await refresh();
-  }
-  start().catch(e=>message(e.message,true));
+'use strict';
+let csrf='',editing=null,company=null,jobItems=[],candidateData={items:[],jobs:[]};
+const $=s=>document.querySelector(s),status={pending:'待平台审核',approved:'平台材料审核通过',rejected:'材料已退回'};
+function el(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;}
+function message(text,error=false){$('#company-message').textContent=text;$('#company-message').classList.toggle('company-error',error);}
+async function api(path,method='GET',data){const options={method,credentials:'same-origin',headers:{'X-CSRF-Token':csrf}};if(data instanceof FormData)options.body=data;else if(data){options.headers['Content-Type']='application/json';options.body=JSON.stringify(data);}const r=await fetch('/api'+path,options);const result=await r.json();if(!r.ok)throw new Error(typeof result.detail==='string'?result.detail:'请求未完成，请重试。');if(result.csrf_token)csrf=result.csrf_token;return result;}
+function page(){return location.pathname.split('/')[2]||'overview';}
+function show(view,push=true){if(!['overview','jobs','publish','candidates','mail'].includes(view))view='overview';if(push)history.pushState({},'', '/company/'+view);document.querySelectorAll('[data-company-view]').forEach(n=>n.hidden=n.dataset.companyView!==view);document.querySelectorAll('[data-company-nav]').forEach(n=>{const active=n.dataset.companyNav===view;n.classList.toggle('active',active);if(active)n.setAttribute('aria-current','page');else n.removeAttribute('aria-current');});$('#company-page-title').textContent={overview:'企业概览',jobs:'岗位管理',publish:'发布招聘岗位',candidates:'授权候选人',mail:'招聘站内信'}[view];}
+function mountIcons(){const ns='http://www.w3.org/2000/svg',names={overview:'grid',jobs:'list',publish:'upload',candidates:'user',mail:'file'};function icon(name){const svg=document.createElementNS(ns,'svg'),use=document.createElementNS(ns,'use');svg.setAttribute('aria-hidden','true');svg.setAttribute('viewBox','0 0 24 24');use.setAttribute('href','#i-'+name);svg.append(use);return svg;}document.querySelectorAll('[data-company-nav]').forEach(link=>link.querySelector('.nav-orbit').replaceChildren(icon(names[link.dataset.companyNav])));const brand=document.querySelector('.company-sidebar .site-brand');brand.prepend(icon('shield'));}
+function reset(){editing=null;$('#company-job-form').reset();$('#company-job-heading').textContent='提交招聘岗位';$('#company-job-cancel').hidden=true;}
+function renderCandidates(){const list=$('#company-candidates'),filter=$('#company-candidate-filter').value;list.replaceChildren();const items=candidateData.items.filter(x=>!filter||String(x.job_id)===filter);if(!items.length)list.append(el('p',company.status==='approved'?'此处还没有有效授权简历。':'企业材料通过平台审核后可以查看主动投递。'));for(const c of items){const card=el('article',undefined,'company-job');card.append(el('h3',c.username),el('span',c.title,'company-badge'),el('p','授权于 '+c.updated+' · 已进行 '+c.interview_count+' 次岗位面试训练'));const details=el('details'),summary=el('summary','查看授权简历');details.append(summary,el('pre',c.resume.text));card.append(details);const contact=el('button','联系意向');contact.onclick=async()=>{try{if(!window.CareerMail?.compose)throw Error('站内信组件尚未加载，请刷新后重试。');show('mail');await window.CareerMail.init('#company-mail-host');await window.CareerMail.compose({recipient_id:c.user_id,application_id:c.id,subject:'关于 '+c.title+' 的求职意向'});}catch(e){message(e.message,true);}};card.append(contact);list.append(card);}}
+async function refresh(){candidateData={items:[],jobs:[]};$('#company-candidates').replaceChildren(el('p','正在重新校验候选人的有效授权…'));company=(await api('/company/me')).company;jobItems=(await api('/company/jobs')).items;candidateData={items:[],jobs:[]};if(company.status==='approved')candidateData=await api('/company/candidates');const info=$('#company-info');info.replaceChildren(el('h2',company.name),el('span',status[company.status]||company.status,'company-badge'),el('p','统一社会信用代码：'+company.credit_code),el('p','联系人职务：'+company.contact_role),el('p',company.review_note?'审核意见：'+company.review_note:'企业材料已提交，可在此查看审核进度。'),el('p',company.ocr_notes.message),el('p','此状态仅代表平台材料审核，不是政府真实性认证。','company-notice'));const original=el('a','查看已提交营业执照');original.href=company.license_url;original.target='_blank';original.rel='noopener';info.append(original);$('#company-job-fields').disabled=company.status!=='approved';message(company.status==='approved'?'企业材料已通过，可以提交岗位审核并查看主动授权的候选人。':'材料审核期间可以查看状态与管理已有岗位。');const metrics=$('#company-metrics');metrics.replaceChildren();for(const [name,value] of [['招聘岗位',jobItems.filter(j=>j.active).length],['有效投递',candidateData.items.length],['岗位面试人数',candidateData.jobs.reduce((sum,j)=>sum+j.interview_users,0)]]){const metric=el('article',undefined,'company-metric panel');metric.append(el('strong',String(value)),el('span',name));metrics.append(metric);}const list=$('#company-jobs');list.replaceChildren();if(!jobItems.length)list.append(el('p','还没有岗位，前往“发布岗位”开启招聘。'));for(const job of jobItems){const stats=candidateData.jobs.find(s=>s.job_id===job.id)||{applicant_count:0,interview_users:0};const card=el('article',undefined,'company-job');card.append(el('h3',job.title),el('span',job.active?({pending:'岗位待审核',approved:'岗位已公开',rejected:'岗位已退回'}[job.status]||job.status):'已下架','company-badge'),el('p',job.description),el('p',stats.applicant_count+' 人主动投递 · '+stats.interview_users+' 人进行岗位面试'));if(job.review_note)card.append(el('p','岗位审核意见：'+job.review_note));const edit=el('button','编辑并重新送审');edit.type='button';edit.disabled=company.status!=='approved';edit.onclick=()=>{editing=job.id;const f=$('#company-job-form');f.elements.title.value=job.title;f.elements.description.value=job.description;$('#company-job-heading').textContent='编辑岗位 · 重新审核';$('#company-job-cancel').hidden=false;show('publish');f.elements.title.focus();};card.append(edit);const view=el('button','查看授权候选人');view.onclick=()=>{$('#company-candidate-filter').value=String(job.id);renderCandidates();show('candidates');};card.append(view);if(job.active){const down=el('button','下架');down.type='button';down.onclick=async()=>{down.disabled=true;try{await api('/company/jobs/'+job.id,'DELETE');await refresh();}catch(e){message(e.message,true);down.disabled=false;}};card.append(down);}list.append(card);}const select=$('#company-candidate-filter'),previous=select.value;select.replaceChildren(el('option','全部岗位'));select.firstChild.value='';for(const j of jobItems){const option=el('option',j.title);option.value=String(j.id);select.append(option);}select.value=previous;renderCandidates();}
+async function start(){csrf=(await api('/auth/session')).csrf_token;if(document.body.dataset.companyPage==='register'){$('#company-register').addEventListener('submit',async ev=>{ev.preventDefault();const form=ev.currentTarget,button=form.querySelector('button[type=submit]'),file=form.elements.license.files[0];if(!file||file.size>8*1024*1024){message('请上传不超过8MB的营业执照。',true);return;}button.disabled=true;message('正在校验并提交材料，请稍候…');try{await api('/company/register','POST',new FormData(form));location.assign('/company');}catch(e){message(e.message,true);button.disabled=false;}});return;}mountIcons();const {user}=await api('/auth/me');if(!user){location.replace('/login?next=company');return;}if(user.role!=='company'){message('当前账号不是企业账号，请使用企业管理员账号登录。',true);return;}document.querySelectorAll('[data-company-nav]').forEach(a=>a.onclick=e=>{e.preventDefault();show(a.dataset.companyNav);});addEventListener('popstate',()=>show(page(),false));show(page(),false);$('#company-refresh').onclick=()=>refresh().catch(e=>message(e.message,true));$('#company-logout').onclick=async()=>{try{await api('/auth/logout','POST');location.assign('/login');}catch(e){message(e.message,true);}};$('#company-candidate-filter').onchange=renderCandidates;$('#company-open-mail').onclick=()=>{if(window.CareerMail?.init)window.CareerMail.init('#company-mail-host');else message('站内信组件尚未加载，请刷新后重试。',true);};$('#company-job-cancel').onclick=reset;$('#company-job-form').onsubmit=async ev=>{ev.preventDefault();const form=ev.currentTarget,button=form.querySelector('[type=submit]');button.disabled=true;try{await api('/company/jobs'+(editing?'/'+editing:''),editing?'PUT':'POST',{title:form.elements.title.value,description:form.elements.description.value});reset();await refresh();show('jobs');message('岗位已提交，等待网站管理员审核后公开。');}catch(e){message(e.message,true);}finally{button.disabled=false;}};await refresh();}
+start().catch(e=>message(e.message,true));
 })();
 ```
 
@@ -6966,6 +7601,347 @@ window.ModelSettingsUI = (() => {
 ```css
 .resume-studio .rs-toolbar{display:flex;gap:12px;align-items:end;flex-wrap:wrap;padding:18px}.resume-studio label{display:grid;gap:7px;font-size:13px}.resume-studio select,.resume-studio textarea,.resume-studio input[type=file]{width:100%;border:1px solid var(--border,var(--line,#dce3e7));border-radius:9px;background:var(--surface,var(--paper,#fff));padding:10px;color:inherit;font:inherit}.resume-studio textarea{resize:vertical;min-height:74px}.rs-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:20px;align-items:start}.rs-layout[hidden]{display:none}.rs-conversation,.rs-editor{padding:24px}.rs-messages{max-height:540px;overflow:auto;display:flex;flex-direction:column;gap:12px;margin:20px 0;padding:2px}.rs-message{white-space:pre-wrap;overflow-wrap:anywhere;border-radius:12px;padding:13px 15px;background:var(--surface-alt,var(--deep,#f3f6f7));line-height:1.75}.rs-message.user{background:var(--deep,#eaf4ef);margin-left:26px}.rs-message.assistant{margin-right:16px}.resume-studio .rs-consent{display:flex;align-items:flex-start;line-height:1.65;margin:14px 0;font-size:12px}.rs-consent input{flex:none;width:16px;height:16px;margin-top:3px}.rs-fields{display:grid;gap:14px;margin:16px 0}.rs-missing{font-size:12px;line-height:1.6;color:var(--muted,#687783);white-space:pre-wrap}.rs-photo{border-top:1px solid var(--border,var(--line,#dce3e7));padding-top:18px;margin-top:24px}.rs-photo summary{cursor:pointer;font-weight:600}.rs-photo p{font-size:13px;line-height:1.8}.rs-portrait{display:block;max-width:180px;max-height:250px;object-fit:contain;border-radius:8px;margin-top:18px}.rs-portrait[hidden]{display:none}.resume-studio button:focus-visible,.resume-studio select:focus-visible,.resume-studio textarea:focus-visible{outline:3px solid #73a797;outline-offset:3px}.resume-studio form>.button{margin-top:10px}@media(max-width:1000px){.rs-layout{grid-template-columns:1fr}}@media(max-width:600px){.rs-conversation,.rs-editor{padding:16px}.resume-studio .rs-toolbar{align-items:stretch;flex-direction:column}.resume-studio textarea{font-size:16px}}
 .rs-polish{grid-column:1/-1;padding:24px}.rs-polish>p{font-size:13px;line-height:1.8}.rs-proposal-fields{display:grid;gap:20px;margin:24px 0}.rs-proposal-field{border-top:1px solid var(--border,var(--line,#dce3e7));padding-top:12px}.rs-compare{display:grid;grid-template-columns:1fr 1fr;gap:18px}.rs-compare>div{min-width:0;border-radius:10px;padding:16px;background:var(--surface-alt,var(--deep,#f3f6f7))}.rs-compare>div:last-child{background:var(--deep,#edf6f1)}.rs-compare p,.rs-citations p,.rs-proposal-field details p{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.8}.rs-proposal-field details,.rs-citations details{margin-top:12px}.rs-proposal-field summary,.rs-citations summary{cursor:pointer;font-size:12px}.rs-polish [data-rs=proposal]{margin-top:20px}@media(max-width:650px){.rs-compare{grid-template-columns:1fr}.rs-polish{padding:16px}}
+```
+
+### `static/account-card.js`
+
+```javascript
+/* Editable account identity. Avatar URLs are fixed same-origin endpoints only. */
+(() => {
+  'use strict';
+  let account=null,user=null,initialized=false,dialog=null,epoch=0,pending=false;
+  const $=s=>document.querySelector(s);
+  const make=(tag,cls='',value='')=>{const el=document.createElement(tag);el.className=cls;el.textContent=value;return el;};
+  const message=(value,error=false)=>{const el=$('#account-card-status');if(el){el.textContent=value;el.classList.toggle('is-error',error);}};
+  function avatar(el,large=false){
+    if(!el||!account)return;
+    el.replaceChildren();
+    if(account.has_avatar){const img=make('img');img.src='/api/account/avatar?v='+encodeURIComponent(account.avatar_revision);img.alt=large?'我的头像':'';img.draggable=false;el.append(img);}
+    else el.textContent=Array.from(account.nickname||user?.username||'我')[0].toUpperCase();
+  }
+  function render(){
+    if(!account||!user)return;
+    const name=account.nickname||user.username;
+    $('#signed-name').textContent=name;$('#account-username').textContent='账号 @'+user.username;
+    $('#account-bio').textContent=account.bio||'用一句话，记录你的职业目标与个人风格。';
+    $('#account-bio').classList.toggle('is-empty',!account.bio);
+    $('#account-city').textContent=account.city?'城市 · '+account.city:'尚未填写城市';
+    $('#account-joined').textContent=String(account.created||'').slice(0,10).replaceAll('-','.')+' 加入';
+    $('#account-status').textContent='你好，'+name+'。在这里管理资料，查看属于你的每一步成长。';
+    const footer=$('.sidebar-footer');
+    if(footer){const image=make('span','avatar account-nav-avatar'),label=make('span','account-nav-name',name);avatar(image);footer.replaceChildren(image,label,make('span','online-dot'));}
+    const top=$('.top-avatar');if(top){avatar(top);top.classList.add('account-nav-avatar');top.title=name;top.setAttribute('aria-label',name+'的头像');}
+    const button=$('#account-top');if(button)button.textContent=name;
+    avatar($('#account-avatar'),true);
+    $('#account-remove-avatar').hidden=!account.has_avatar;
+  }
+  function setBusy(value){
+    pending=value;
+    for(const el of [$('#account-change-avatar'),$('#account-edit'),$('#account-avatar-file'),...dialog.querySelectorAll('input,textarea,button')])if(el)el.disabled=value;
+    $('#account-change-avatar').setAttribute('aria-busy',String(value));
+  }
+  function initialize(){
+    if(initialized||!$('#account-change-avatar'))return;
+    initialized=true;dialog=make('dialog','account-editor');dialog.setAttribute('aria-labelledby','account-editor-heading');
+    const heading=make('h2','','让资料，更像你');heading.id='account-editor-heading';
+    const note=make('p','muted','昵称用于页面显示，登录账号保持不变。');
+    const form=make('form'),fields={};
+    for(const [key,label,limit,placeholder] of [['nickname','昵称',24,'怎么称呼你？'],['city','所在城市',40,'例如：杭州（选填）'],['bio','个人简介',160,'分享你的职业方向、兴趣或一句座右铭（选填）']]){
+      const box=make('div','field'),caption=make('label','',label),input=make(key==='bio'?'textarea':'input');
+      input.id='account-edit-'+key;input.name=key;input.maxLength=limit;input.placeholder=placeholder;caption.htmlFor=input.id;
+      if(key==='bio')input.rows=4;else input.type='text';
+      input.autocomplete=key==='nickname'?'nickname':key==='city'?'address-level2':'off';
+      const hint=make('small','account-field-hint',key==='nickname'?'最多24字，留空则显示登录账号':'最多'+limit+'字');
+      box.append(caption,input,hint);form.append(box);fields[key]=input;
+    }
+    const error=make('p','account-form-error');error.setAttribute('role','status');
+    const controls=make('div','button-row'),cancel=make('button','button secondary','取消'),save=make('button','button primary','保存资料');cancel.type='button';save.type='submit';controls.append(cancel,save);form.append(error,controls);
+    const remove=make('button','account-remove-avatar','恢复默认头像');remove.id='account-remove-avatar';remove.type='button';
+    dialog.append(heading,note,form,remove);document.body.append(dialog);
+    $('#account-edit').onclick=()=>{if(pending||!account)return;for(const key in fields)fields[key].value=account[key]||'';error.textContent='';dialog.showModal();fields.nickname.focus();};
+    cancel.onclick=()=>dialog.close();
+    dialog.addEventListener('cancel',e=>{if(pending)e.preventDefault();});
+    form.onsubmit=async e=>{
+      e.preventDefault();if(pending)return;const version=++epoch;setBusy(true);error.textContent='';
+      try{const data=Object.fromEntries(Object.entries(fields).map(([k,v])=>[k,v.value.trim()]));const result=await window.api('/account',{method:'PUT',data});if(version!==epoch)return;account=result;render();dialog.close();message('资料已保存，页面中的头像和称呼已同步。');window.toast?.('个人资料已保存。');}
+      catch(e){if(version===epoch)error.textContent=e.message;}
+      finally{if(version===epoch)setBusy(false);}
+    };
+    $('#account-change-avatar').onclick=()=>{if(!pending)$('#account-avatar-file').click();};
+    $('#account-avatar-file').onchange=async e=>{
+      const file=e.target.files?.[0];if(!file||pending)return;e.target.value='';
+      if(!['image/png','image/jpeg','image/webp'].includes(file.type)){message('请选择PNG、JPEG或WebP静态图片。',true);return;}
+      if(file.size>4*1024*1024){message('头像文件请控制在4MB以内。',true);return;}
+      const version=++epoch;setBusy(true);message('正在处理头像…');
+      try{const result=await window.api('/account/avatar',{method:'POST',body:file,headers:{'Content-Type':file.type}});if(version!==epoch)return;account=result;render();message('头像已更新。图片已自动居中裁切并去除原图元数据。');}
+      catch(e){if(version===epoch)message(e.message,true);}
+      finally{if(version===epoch)setBusy(false);}
+    };
+    remove.onclick=async()=>{
+      if(pending)return;const version=++epoch;setBusy(true);
+      try{const result=await window.api('/account/avatar',{method:'DELETE'});if(version!==epoch)return;account=result;render();message('已恢复默认头像。');}
+      catch(e){if(version===epoch)error.textContent=e.message;}
+      finally{if(version===epoch)setBusy(false);}
+    };
+    window.addEventListener('account-data-erased',()=>{
+      epoch++;account=null;dialog.close();for(const f of Object.values(fields))f.value='';$('#account-avatar-file').value='';setBusy(false);
+      for(const el of [$('#account-avatar'),$('.top-avatar'),$('.sidebar-footer .avatar')])el?.replaceChildren();
+    });
+  }
+  window.AccountCard={async load(identity){
+    initialize();if(!initialized||pending)return;user=identity;const version=++epoch;
+    try{const result=await window.api('/account');if(version!==epoch)return;account=result;render();}
+    catch(e){if(version===epoch)message('个人资料暂未加载：'+e.message,true);}
+  }};
+  const ready=()=>{if(!initialized&&typeof platform!=='undefined'&&platform.user)window.AccountCard.load(platform.user);};
+  if(window.careerPlatformReady)ready();else window.addEventListener('platform-loaded',ready,{once:true});
+})();
+```
+
+### `static/account-card.css`
+
+```css
+.account-card.panel{padding:0;overflow:hidden;position:relative;align-self:start}.account-card-cover{height:96px;padding:22px 26px;border-bottom:1px solid #a6b7ff15;background:radial-gradient(ellipse at 85% 20%,#657ce12e,transparent 60%),linear-gradient(110deg,#20375455,#19244166);position:relative}.account-card-cover:after{content:"";position:absolute;inset:0;background-image:linear-gradient(#b9ceff08 1px,transparent 1px),linear-gradient(90deg,#b9ceff08 1px,transparent 1px);background-size:25px 25px;mask-image:linear-gradient(90deg,transparent,#000)}.account-card-cover>span{font-size:9px;letter-spacing:.22em;color:#acbee2;position:relative;z-index:1}.account-card-content{padding:0 26px 24px}.account-identity-row{display:flex;align-items:flex-end;justify-content:space-between;margin-top:-35px;position:relative}.account-avatar-button{width:96px;height:96px;position:relative;border-radius:50%;padding:5px;border:1px solid #b7d3ff55;background:#111c31;cursor:pointer;box-shadow:0 6px 22px #0004;transition:transform .2s,box-shadow .2s}.account-avatar-button:hover{transform:translateY(-2px);box-shadow:0 5px 28px #7398ff33}.account-avatar-button:focus-visible{outline:3px solid #a6c0ff;outline-offset:5px}.account-avatar-image{display:flex;align-items:center;justify-content:center;overflow:hidden;width:84px;height:84px;border-radius:50%;font-size:32px;font-weight:650;color:#e7eeff;background:radial-gradient(circle at 25% 20%,#648ca6,#324772 68%,#252b53)}.account-avatar-image img,.account-nav-avatar img{width:100%;height:100%;object-fit:cover;display:block;border-radius:inherit}.account-avatar-edit{position:absolute;right:-1px;bottom:1px;width:27px;height:27px;border-radius:50%;display:grid;place-items:center;background:#a8bfff;color:#172138;border:3px solid #101a2c}.account-avatar-edit svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linejoin:round}.account-identity-row .badge{margin-bottom:8px}.account-card-title{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:24px}.account-kicker{font-size:10px;letter-spacing:.12em;color:#9dafce;margin:0 0 7px}.account-card-title h2{font-size:29px;line-height:1.25;letter-spacing:-.03em;margin:0;overflow-wrap:anywhere}.account-card-title>div{min-width:0}.account-card-title .button{flex-shrink:0;gap:9px}.account-handle{font-size:12px;color:#8e9fbd;margin:8px 0 0;overflow-wrap:anywhere}.account-bio{font-size:14px;line-height:1.9;color:#c6d3e8;white-space:pre-wrap;overflow-wrap:anywhere;margin:22px 0 18px;min-height:26px}.account-bio.is-empty{color:#899bb9}.account-meta{display:flex;flex-wrap:wrap;gap:12px 20px;font-size:11px;color:#92a7ca}.account-meta>span:before{content:"";display:inline-block;width:4px;height:4px;border-radius:50%;background:#879fde;margin-right:7px;vertical-align:middle}.account-card-footer{border-top:1px solid #a8c1ff16;margin-top:24px;padding-top:18px;display:flex;align-items:center;gap:18px;justify-content:space-between}.account-card-footer .fine-print{font-size:10px;line-height:1.8;max-width:260px;margin:0;color:#8499bb}.account-card-footer .fine-print.is-error{color:#ffc2b7}.account-card-footer .button{flex-shrink:0}.account-nav-avatar{overflow:hidden;flex-shrink:0}.account-nav-name{max-width:125px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.account-editor{width:min(460px,calc(100vw - 32px));padding:30px;border-radius:24px;border:1px solid #acc9ff3b;background:#111d30ed;backdrop-filter:blur(26px);color:#e8efff;box-shadow:0 28px 100px #0009;max-height:calc(100dvh - 40px);overflow:auto}.account-editor::backdrop{background:#03071195;backdrop-filter:blur(6px)}.account-editor h2{margin:0 0 10px;font-size:27px;letter-spacing:-.03em}.account-editor>.muted{font-size:12px;line-height:1.8;margin-bottom:24px}.account-editor .field{margin:16px 0}.account-editor input,.account-editor textarea{width:100%;box-sizing:border-box}.account-field-hint{font-size:10px;color:#8e9fbc}.account-form-error{font-size:12px;color:#ffc2b7;line-height:1.7}.account-editor .button-row{justify-content:flex-end;margin-top:22px}.account-remove-avatar{border:0;background:transparent;color:#a7bada;font-size:11px;padding:0;margin-top:24px;cursor:pointer;text-decoration:underline;text-underline-offset:4px}.account-remove-avatar:hover{color:#fff}.account-card [hidden],.account-editor [hidden]{display:none!important}@media(max-width:700px){.account-card-content{padding:0 20px 22px}.account-card-cover{padding:19px 20px}.account-card-title{gap:12px}.account-card-title h2{font-size:25px}.account-card-title .button{font-size:11px;padding:9px 12px}.account-card-footer{align-items:flex-start}.account-editor{padding:24px}.account-nav-name{max-width:100px}}@media(prefers-reduced-motion:reduce){.account-avatar-button{transition:none}.account-avatar-button:hover{transform:none}}
+```
+
+### `static/admin-pages.js`
+
+```javascript
+/* Independent pages preserve mounted forms and their unsaved state. */
+(function(root,factory){const api=factory();if(typeof module==='object'&&module.exports)module.exports=api;else root.AdminPages=api;})(typeof window==='undefined'?this:window,function(){
+  'use strict';
+  const pages={
+    overview:['平台总览','PLATFORM / OVERVIEW','查看平台运行、账号规模与近期使用情况。','grid'],
+    users:['用户管理','ACCOUNTS / MEMBERS','维护平台账号和访问状态。','user'],
+    jobs:['岗位审核与推荐','JOBS / MODERATION','审核企业岗位，维护面向求职者的推荐机会。','list'],
+    reviews:['点评管理','REVIEWS / MODERATION','维护公开点评，处理不适宜展示的内容。','check'],
+    companies:['企业材料审核','COMPANIES / VERIFICATION','核验企业原件和资料，处理认证申请。','shield'],
+    models:['AI 模型设置','INTELLIGENCE / MODELS','分别配置对话、向量与图片模型；保存配置不会自动连接。','spark'],
+    knowledge:['共享知识库','KNOWLEDGE / LIBRARY','维护知识文档，查看检索状态并按需手动构建索引。','file'],
+    security:['安全与审计','SECURITY / AUDIT','检查内置防护，验证提示注入规则并查看操作审计。','lock'],
+    mail:['邮件与通知','MAIL / DELIVERY','配置邮件服务，管理平台邮件通知。','arrow']
+  };
+  const aliases={'#view-admin':'overview','#admin-users':'users','#admin-publish':'jobs','#admin-jobs':'jobs','#admin-reviews':'reviews','#admin-companies':'companies','#admin-ai-settings':'models','#admin-security':'security'};
+  function resolve(href){const u=new URL(href,'http://localhost'),p=u.searchParams.get('page');return Object.hasOwn(pages,p)?p:(!p&&aliases[u.hash])||'overview';}
+  function pageURL(href,page){const u=new URL(href,'http://localhost');u.searchParams.set('page',Object.hasOwn(pages,page)?page:'overview');u.hash='';return u.pathname+u.search;}
+  function render(doc,page){
+    page=Object.hasOwn(pages,page)?page:'overview';
+    doc.querySelectorAll('[data-admin-page]').forEach(el=>{el.hidden=!el.dataset.adminPage.split(' ').includes(page);});
+    doc.querySelectorAll('[data-admin-route]').forEach(link=>{const active=link.dataset.adminRoute===page;link.classList.toggle('active',active);if(active)link.setAttribute('aria-current','page');else link.removeAttribute('aria-current');});
+    const [title,eyebrow,description]=pages[page];
+    for(const [id,value] of [['admin-page-title',title],['admin-page-eyebrow',eyebrow],['admin-page-description',description],['admin-breadcrumb','管理后台 / '+title]]){const el=doc.getElementById(id);if(el)el.textContent=value;}
+    doc.title=title+' · 职安管理控制台';return page;
+  }
+  let started=false;
+  function refresh(){return render(document,resolve(location.href));}
+  function go(page,{replace=false,focus=true}={}){const href=pageURL(location.href,page);if(href!==location.pathname+location.search+location.hash)history[replace?'replaceState':'pushState']({},'',href);refresh();if(focus)document.getElementById('admin-page-title')?.focus({preventScroll:true});window.scrollTo({top:0,behavior:'instant'});}
+  function init(){
+    if(started)return refresh();started=true;
+    const nav=document.querySelector('.admin-sidebar nav');nav.replaceChildren();
+    Object.entries(pages).forEach(([key,[title,,,icon]])=>{const link=document.createElement('a');link.href=pageURL('/admin',key);link.dataset.adminRoute=key;link.className='nav-item';const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('aria-hidden','true');const use=document.createElementNS('http://www.w3.org/2000/svg','use');use.setAttribute('href','#i-'+icon);svg.append(use);const label=document.createElement('span');label.textContent=title;link.append(svg,label);nav.append(link);});
+    nav.addEventListener('click',e=>{const link=e.target.closest('[data-admin-route]');if(!link||e.button!==0||e.metaKey||e.ctrlKey||e.shiftKey||e.altKey)return;e.preventDefault();go(link.dataset.adminRoute);});
+    window.addEventListener('popstate',()=>{refresh();document.getElementById('admin-page-title')?.focus({preventScroll:true});});
+    go(resolve(location.href),{replace:true,focus:false});document.getElementById('admin-main').removeAttribute('aria-busy');
+  }
+  return {pages,resolve,pageURL,render,init,go,refresh};
+});
+```
+
+### `static/recruitment-bridge.js`
+
+```javascript
+/* Only fixed application events can prepare the interview form; model consent stays manual. */
+(() => {
+  'use strict';
+  let mailHost=null,mounted=false,mailReady=false,lastUnread=null;
+  function prepare(detail){
+    if(!detail||typeof detail.occupation!=='string'||typeof detail.jd!=='string')return;
+    const id=detail.application_id;
+    if(id!==null&&(!Number.isInteger(id)||id<1))return;
+    stopVoice();window.CameraAssist?.stop();platform.interviewEpoch++;platform.interview=null;
+    platform.applicationId=id;platform.applicationJob=detail.job||null;
+    document.querySelector('#interview-occupation').value=detail.occupation.slice(0,160);
+    document.querySelector('#interview-jd').value=detail.jd.slice(0,12000);
+    document.querySelector('#interview-consent').checked=false;
+    document.querySelector('#interview-messages').replaceChildren();
+    document.querySelector('#interview-answer').value='';
+    const note=document.querySelector('#interview-application-note');note.hidden=!id;
+    document.querySelector('#interview-application-context').textContent=id?'已授权向该岗位企业投递简历。正式开始后计入此岗位面试人数；面试对话、评分、声音和镜头画面不向企业公开。':'';
+    show('interview');toast(detail.notice||'岗位已填好。核对后勾选AI授权，再开始面试。');
+  }
+  async function initMail(){
+    if(!mailHost||!window.CareerMail)return;
+    if(mailReady){await window.CareerMail.refresh();return;}
+    mailReady=true;
+    try{await window.CareerMail.init(mailHost);}catch(e){mailReady=false;toast(e.message,true);}
+  }
+  function mount(){
+    if(mounted)return;mounted=true;
+    titles.mail='站内邮件';
+    const section=node('section','view');section.id='view-mail';section.hidden=true;
+    const heading=node('div','page-heading'),title=node('div');title.append(node('h1','','每一次沟通，都有回音。'),node('p','','接收企业意向邀请与平台通知，回复后继续了解机会。'));heading.append(title);
+    mailHost=node('article','panel');mailHost.id='career-mail-host';section.append(heading,mailHost);
+    document.querySelector('#main').insertBefore(section,document.querySelector('.page-footer'));
+    const nav=node('button','nav-item');nav.type='button';nav.dataset.view='mail';
+    const badge=node('span','badge green');badge.hidden=true;badge.setAttribute('aria-hidden','true');
+    nav.append(icon('list'),node('span','','站内邮件'),badge);
+    document.querySelector('.sidebar nav').insertBefore(nav,document.querySelector('.nav-item[data-view="profile"]'));
+    nav.onclick=()=>show('mail');
+    window.addEventListener('career:application-ready',event=>prepare(event.detail));
+    window.addEventListener('viewchange',event=>{if(event.detail==='mail')initMail().catch(e=>toast(e.message,true));});
+    window.addEventListener('career:mail-state',event=>{
+      const count=Number(event.detail?.unread);if(!Number.isInteger(count)||count<0)return;
+      badge.hidden=!count;badge.textContent=count>99?'99+':String(count);nav.setAttribute('aria-label',count?'站内邮件，'+count+'封未读':'站内邮件');
+      if(lastUnread!==null&&count>lastUnread)toast('收到新的站内邮件，可前往收件箱查看。');lastUnread=count;
+    });
+    window.addEventListener('account-data-erased',()=>{mailReady=false;initMail().catch(e=>toast(e.message,true));});
+    initMail().catch(e=>toast(e.message,true));
+    if(location.hash==='#mail')show('mail');
+    window.addEventListener('hashchange',()=>{if(location.hash==='#mail')show('mail');});
+  }
+  if(window.careerPlatformReady)mount();else window.addEventListener('platform-loaded',mount,{once:true});
+})();
+```
+
+### `static/recruitment-ui.js`
+
+```javascript
+(() => {
+'use strict';
+const node=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
+async function api(path,method='GET',data){const token=(await fetch('/api/auth/session',{credentials:'same-origin'}).then(r=>r.json())).csrf_token;const r=await fetch('/api'+path,{method,credentials:'same-origin',headers:{'X-CSRF-Token':token,'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined});const result=await r.json();if(!r.ok)throw new Error(typeof result.detail==='string'?result.detail:'操作未完成。');return result;}
+function modal(title){const d=node('dialog',undefined,'recruitment-dialog');const h=node('h2',title),close=node('button','关闭','recruitment-close');close.type='button';close.onclick=()=>d.close();d.append(close,h);d.addEventListener('close',()=>d.remove());document.body.append(d);d.showModal();return d;}
+async function open(job){if(!job.company_id){window.dispatchEvent(new CustomEvent('career:application-ready',{detail:{application_id:null,job,occupation:job.title,jd:job.description,consent:false,notice:'此岗位仅用于个人面试练习，不向企业投递或共享简历。'}}));return;}const d=modal('投递与岗位面试');d.append(node('p',job.title+' · '+job.company),node('p','选择简历并主动授权后，该企业可查看本次简历快照。面试训练对话、视频与评分不会向企业公开。'));const form=node('form'),label=node('label','选择要共享的简历'),select=node('select');select.name='source';const profile=node('option','个人资料中保存的简历');profile.value='profile';select.append(profile);label.append(select);form.append(label);const share=node('input');share.type='checkbox';share.required=true;const check=node('label',undefined,'recruitment-check');check.append(share,node('span','我同意向此岗位企业共享所选简历快照，用于本次主动投递与联系。'));form.append(check);const interview=node('input');interview.type='checkbox';interview.checked=true;const training=node('label',undefined,'recruitment-check');training.append(interview,node('span','投递后进入此岗位的面试训练准备（AI发送授权将在面试页另行确认）。'));form.append(training);const message=node('p');message.role='status';const button=node('button','确认授权并继续');button.type='submit';form.append(message,button);d.append(form);try{const {items}=await api('/resume/sessions');for(const item of items){const opt=node('option','简历工作室 · '+item.title);opt.value=item.id;select.append(opt);}}catch(e){message.textContent='可使用个人资料简历。'+e.message;}form.onsubmit=async e=>{e.preventDefault();button.disabled=true;try{const result=await api('/jobs/'+job.id+'/apply','POST',{resume_source:select.value==='profile'?'profile':'studio',resume_session_id:select.value==='profile'?null:select.value,share_resume:share.checked,interview_consent:interview.checked});d.close();if(interview.checked)window.dispatchEvent(new CustomEvent('career:application-ready',{detail:{application_id:result.id,job:result.job,occupation:result.occupation,jd:result.jd,consent:false}}));else{const done=modal('投递已保存');done.append(node('p','该企业现在可以查看你授权的简历。你可以在“我的投递”中撤回。'));}}catch(error){message.textContent=error.message;button.disabled=false;}};}
+async function mine(){const d=modal('我的投递');try{const result=await api('/applications');if(!result.items.length)d.append(node('p','尚未主动投递岗位。'));for(const item of result.items){const card=node('article');card.append(node('h3',item.title),node('p',item.company+' · '+(item.status==='active'?'已授权':'已撤回')));if(item.status==='active'){const withdraw=node('button','撤回授权');withdraw.onclick=async()=>{withdraw.disabled=true;try{await api('/applications/'+item.id,'DELETE');d.close();mine();}catch(e){withdraw.disabled=false;card.append(node('p',e.message));}};card.append(withdraw);}d.append(card);}}catch(e){d.append(node('p',e.message));}}
+window.RecruitmentUI={open,mine};
+})();
+```
+
+### `static/recruitment-ui.css`
+
+```css
+.recruitment-dialog{width:min(580px,calc(100% - 36px));max-height:85dvh;overflow:auto;padding:30px;border:1px solid #90b1ec55;border-radius:24px;background:#0c1526;color:#e5edff;box-shadow:0 30px 120px #0009}.recruitment-dialog::backdrop{background:#040911bf}.recruitment-dialog p{line-height:1.8;color:#b4c4dd}.recruitment-dialog label{display:block;margin:20px 0}.recruitment-dialog select{display:block;width:100%;padding:12px;margin-top:10px;background:#15233a;color:#edf3ff;border:1px solid #86a8df55;border-radius:10px}.recruitment-dialog .recruitment-check{display:flex;gap:12px;align-items:flex-start;line-height:1.8}.recruitment-check input{margin-top:8px;flex-shrink:0}.recruitment-dialog button{padding:10px 18px;background:#aecbff;color:#0a1830;border:0;border-radius:20px;cursor:pointer}.recruitment-dialog .recruitment-close{float:right;background:#20314b;color:#dde9ff}.recruitment-dialog article{border-top:1px solid #ffffff20;padding:16px 0}.recruitment-dialog :focus-visible{outline:2px solid #e2ecff;outline-offset:3px}
+```
+
+### `static/mail-ui.html`
+
+```html
+<section class="career-mail" aria-label="站内邮件"><p>站内邮件组件由 mail-ui.js 加载。收发仅限平台内；同步邮箱需主动验证并授权。</p></section>
+```
+
+### `static/mail-ui.js`
+
+```javascript
+(() => {
+  'use strict';
+  let csrf='',root=null,role='',folder='inbox',cursor=0,poller=null,epoch=0,pollAbort=null,adminEpoch=0,adminCsrf='';
+  const delivery={internal:'站内已送达',email_sent:'站内已送达 · 邮箱同步已提交',email_failed:'站内已送达 · 邮箱同步失败',email_unavailable:'站内已送达 · 对方邮箱未验证/未授权，或SMTP未启用'};
+  function node(tag,text,cls){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e;}
+  function button(text,handler){const b=node('button',text);b.type='button';b.onclick=()=>Promise.resolve(handler()).catch(error=>status(error.message,true));return b;}
+  async function api(path,method='GET',data,signal,scope='mail'){
+    const generation=scope==='admin'?adminEpoch:epoch;
+    let token=scope==='admin'?adminCsrf:csrf;
+    if(!token){
+      const session=await (await fetch('/api/auth/session',{credentials:'same-origin'})).json();
+      if(generation!==(scope==='admin'?adminEpoch:epoch))throw Error('页面状态已更新。');
+      token=session.csrf_token;if(scope==='admin')adminCsrf=token;else csrf=token;
+    }
+    const opts={method,signal,credentials:'same-origin',headers:{'X-CSRF-Token':token}};
+    if(data!==undefined){opts.headers['Content-Type']='application/json';opts.body=JSON.stringify(data);}
+    const r=await fetch('/api'+path,opts),d=await r.json();
+    if(!r.ok)throw Error(typeof d.detail==='string'?d.detail:'操作失败，请重试。');
+    return d;
+  }
+  function adminApi(path,method='GET',data){return api(path,method,data,undefined,'admin');}
+
+  function publishState(d){window.dispatchEvent(new CustomEvent('career:mail-state',{detail:{unread:Number(d.unread)||0,cursor:Number(d.cursor)||0}}));}
+  function status(text,error=false){if(!root)return;const e=root.querySelector('.mail-status');if(e){e.textContent=text;e.classList.toggle('mail-error',error);}}
+  function field(form,title,name,type='text',value=''){const label=node('label',title),input=node(type==='textarea'?'textarea':'input');input.name=name;if(type!=='textarea')input.type=type;input.value=value;if(type==='checkbox')label.prepend(input);else label.append(input);form.append(label);return input;}
+  async function refresh(){if(!root)return;const run=epoch,host=root;const d=await api('/mail/'+folder);if(run!==epoch||host!==root)return;publishState(d);cursor=Math.max(cursor,d.cursor);root.querySelector('[data-unread]').textContent='未读 '+d.unread;const list=root.querySelector('.mail-list');list.replaceChildren();if(!d.items.length)list.append(node('p',folder==='sent'?'暂无已发邮件。':'收件箱为空。','mail-note'));for(const t of d.items){const b=button((t.unread?'● ':'')+t.subject,()=>open(t.id));if(t.unread)b.classList.add('mail-unread');b.append(node('small',' · '+t.created));list.append(b);}}
+  async function open(id){const run=epoch;const t=await api('/mail/threads/'+id);if(run!==epoch)return;const detail=root.querySelector('.mail-detail');detail.replaceChildren(node('h3',t.subject));for(const m of t.messages){const card=node('article',undefined,'mail-message');card.append(node('small',m.sender+' · '+m.created),node('p',m.body),node('small',delivery[m.delivery]||m.delivery,'mail-note'));detail.append(card);}const form=node('form'),body=field(form,'回复正文','body','textarea');body.required=true;body.maxLength=12000;const sync=field(form,'同时同步至对方已验证且授权的邮箱','sync','checkbox');const send=node('button','发送回复');send.type='submit';form.append(send);form.onsubmit=async e=>{e.preventDefault();send.disabled=true;try{const r=await api('/mail/threads/'+id+'/reply','POST',{body:body.value,sync_email:sync.checked});await open(id);await refresh();status(delivery[r.delivery]);}catch(error){status(error.message,true);}finally{send.disabled=false;}};detail.append(form);await api('/mail/threads/'+id+'/read','POST');await refresh();}
+  async function compose(options={}){if(!root)throw Error('请先初始化站内邮件组件。');const detail=root.querySelector('.mail-detail');detail.replaceChildren(node('h3',options.application_id?'询问求职意向':'发送站内通知'));const form=node('form');if(!options.application_id&&role!=='admin'){status('求职者请在已有邮件会话内回复。',true);return;}let target;if(!options.application_id){target=field(form,'收件站内用户编号','recipient','number',options.recipient_id||'');target.min='1';target.required=true;}else detail.append(node('p','关联投递编号：'+options.application_id+'；收件人由服务器确认。','mail-note'));const subject=field(form,'主题','subject','text',options.subject||'');subject.required=true;subject.maxLength=160;const body=field(form,'正文','body','textarea',options.body||'');body.required=true;body.maxLength=12000;const sync=field(form,'同时同步至对方已验证且授权的邮箱','sync','checkbox');const send=node('button','发送站内邮件');send.type='submit';form.append(send);form.onsubmit=async e=>{e.preventDefault();send.disabled=true;try{const d={subject:subject.value,body:body.value,sync_email:sync.checked};if(options.application_id)d.application_id=Number(options.application_id);else d.recipient_id=Number(target.value);const r=await api('/mail/threads','POST',d);await open(r.id);await refresh();status(delivery[r.delivery]);}catch(error){status(error.message,true);}finally{send.disabled=false;}};detail.append(form);subject.focus();}
+  async function addressUI(){const run=epoch,host=root;const d=await api('/mail/address');if(run!==epoch||host!==root)return;const details=node('details',undefined,'mail-settings');details.append(node('summary','关联并验证接收邮箱'));const info=node('p',d.verified?'邮箱已验证。':'邮箱尚未验证；不会向该地址同步职业消息。','mail-note');details.append(info);const f=node('form'),email=field(f,'接收邮箱','email','email',d.email);email.required=true;const consent=field(f,'我同意接收平台职业联系邮件','consent','checkbox');consent.checked=d.consent;const save=node('button','保存邮箱');save.type='submit';f.append(save);f.onsubmit=async e=>{e.preventDefault();try{const r=await api('/mail/address','POST',{email:email.value,consent:consent.checked});info.textContent=r.verified?'邮箱已验证。':'邮箱已保存，请发送验证码完成验证。';}catch(err){status(err.message,true);}};f.append(button('发送验证码',async()=>{await api('/mail/address/send-code','POST');info.textContent='验证码已发送，十分钟有效。';}));const code=field(f,'6位邮箱验证码','code','text');code.inputMode='numeric';code.maxLength=6;f.append(button('确认验证码',async()=>{await api('/mail/address/verify','POST',{code:code.value});info.textContent='邮箱已验证；勾选授权后可接收职业消息。';code.value='';}));details.append(f,node('p',d.outbound_available?'SMTP已启用；仅手动发送时可同步。':'当前SMTP未启用，站内收发可正常使用。','mail-note'));root.append(details);}
+  async function init(container){const e=typeof container==='string'?document.querySelector(container):container;if(!e)return;epoch++;const run=epoch;if(poller)clearTimeout(poller);if(pollAbort)pollAbort.abort();pollAbort=null;csrf='';cursor=0;root=e;root.classList.add('career-mail');root.replaceChildren();const toolbar=node('div',undefined,'mail-toolbar'),count=node('strong','未读 0');count.dataset.unread='';toolbar.append(button('收件箱',async()=>{folder='inbox';await refresh();}),button('已发送',async()=>{folder='sent';await refresh();}),button('刷新',refresh),count);const statusEl=node('p','','mail-status');statusEl.setAttribute('role','status');const layout=node('div',undefined,'mail-layout');layout.append(node('div',undefined,'mail-list'),node('div','选择邮件查看和回复。','mail-detail'));root.append(node('p','站内联系 · 外部邮箱同步需验证和主动授权。','mail-note'),toolbar,statusEl,layout);try{const me=await api('/auth/me');if(run!==epoch)return;role=me.user?.role||'';if(role==='admin')toolbar.append(button('发送通知',()=>compose()));await refresh();if(run!==epoch)return;await addressUI();if(run!==epoch)return;async function poll(){if(run!==epoch||!root.isConnected)return;try{pollAbort=new AbortController();const d=await api('/mail/events?after='+cursor+'&timeout=15','GET',undefined,pollAbort.signal);if(run!==epoch)return;publishState(d);if(d.cursor>cursor)await refresh();else root.querySelector('[data-unread]').textContent='未读 '+d.unread;}catch{}if(run===epoch)poller=setTimeout(poll,3000);}poller=setTimeout(poll,3000);}catch(error){if(run===epoch)status(error.message,true);}}
+  async function adminInit(container){const el=typeof container==='string'?document.querySelector(container):container;if(!el)return;const run=++adminEpoch;adminCsrf='';el.classList.add('career-mail');el.replaceChildren(node('h3','可选SMTP外发'),node('p','默认关闭。保存只写入加密配置，不连接、不发送测试邮件。支持465 SSL或587 STARTTLS；自定义主机需服务器SMTP_ALLOWED_HOSTS允许。','mail-note'));const result=node('p','','mail-status');result.setAttribute('role','status');el.append(result);try{const d=await adminApi('/admin/mail/config');if(run!==adminEpoch)return;const f=node('form');const host=field(f,'SMTP主机','host','text',d.host||'');const port=field(f,'端口（465或587）','port','number',d.port||587);const username=field(f,'SMTP用户名','username','text',d.username||'');const password=field(f,d.password_configured?'SMTP密码（留空保留）':'SMTP密码','password','password');password.autocomplete='new-password';const from=field(f,'发件邮箱','from','email',d.from_address||'');const enabled=field(f,'启用真实SMTP外发','enabled','checkbox');enabled.checked=d.enabled;const save=node('button','保存SMTP配置');save.type='submit';f.append(save);f.onsubmit=async e=>{e.preventDefault();save.disabled=true;try{const r=await adminApi('/admin/mail/config','POST',{host:host.value,port:Number(port.value),username:username.value,password:password.value,from_address:from.value,enabled:enabled.checked});if(run!==adminEpoch)return;password.value='';result.textContent=r.notice;}catch(error){result.textContent=error.message;}finally{save.disabled=false;}};el.append(f);}catch(error){result.textContent=error.message;}}
+  window.CareerMail={init,compose,refresh};window.MailUI=window.CareerMail;window.MailAdminUI={init:adminInit};
+})();
+```
+
+### `static/mail-ui.css`
+
+```css
+/* Self-contained dark mail surfaces for the candidate, company and admin shells. */
+.career-mail{
+  --mail-text:#e2ecff;
+  --mail-muted:#9caec9;
+  --mail-line:rgba(151,181,230,.2);
+  color:var(--mail-text);
+  color-scheme:dark;
+  font:inherit;
+  line-height:1.65;
+  min-width:0;
+  padding:20px;
+  border:1px solid var(--mail-line);
+  border-radius:20px;
+  background:linear-gradient(145deg,rgba(24,40,65,.96),rgba(13,25,44,.98));
+  box-shadow:0 12px 36px rgba(2,8,20,.14);
+}
+.career-mail,.career-mail *,.career-mail *::before,.career-mail *::after{box-sizing:border-box}
+.career-mail h3{color:#f0f5ff;font-size:18px;line-height:1.4;margin:0 0 14px;font-weight:650}
+.career-mail p{color:var(--mail-text);margin:0 0 14px}
+.career-mail small{color:var(--mail-muted);font-size:12px;line-height:1.6}
+.career-mail button,.career-mail input,.career-mail textarea,.career-mail select{font:inherit;letter-spacing:normal}
+.career-mail button{
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  cursor:pointer;border:1px solid rgba(123,169,235,.32);border-radius:10px;
+  background:linear-gradient(135deg,#203a5c,#1c304d);color:#e3eeff;
+  padding:10px 15px;min-height:42px;line-height:1.4;font-weight:550;
+  box-shadow:0 2px 7px rgba(1,7,19,.12);
+}
+.career-mail button:hover{background:#294667;border-color:#6a94c7;color:#fff}
+.career-mail button:disabled{opacity:.5;cursor:wait}
+.career-mail :is(button,input,textarea,select,summary):focus-visible{outline:2px solid #8dbfff;outline-offset:3px}
+.career-mail .mail-toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
+.career-mail .mail-toolbar strong{color:#a9d8ff;font-size:13px;padding:7px 11px;margin-left:auto;border:1px solid rgba(115,177,235,.22);border-radius:20px;background:rgba(64,120,174,.12)}
+.career-mail .mail-layout{display:grid;grid-template-columns:minmax(200px,280px) minmax(0,1fr);gap:16px;align-items:start}
+.career-mail :is(.mail-list,.mail-detail,.mail-settings){
+  border:1px solid var(--mail-line);border-radius:15px;padding:18px;min-width:0;
+  background:linear-gradient(155deg,rgba(22,37,60,.94),rgba(12,24,42,.94));
+}
+.career-mail .mail-list,.career-mail .mail-detail{min-height:230px}
+.career-mail .mail-list button{display:block;text-align:left;width:100%;margin:0 0 9px;overflow-wrap:anywhere;white-space:normal;background:rgba(46,71,105,.34);font-size:14px;line-height:1.65}
+.career-mail .mail-list button:last-child{margin-bottom:0}
+.career-mail .mail-list button:hover{background:rgba(65,103,150,.42)}
+.career-mail .mail-list button small{display:block;margin-top:5px;color:#a6bad6;font-weight:400}
+.career-mail .mail-detail p,.career-mail .mail-message p{white-space:pre-wrap;overflow-wrap:anywhere}
+.career-mail .mail-message{padding:15px 0;border-bottom:1px solid var(--mail-line)}
+.career-mail .mail-message p{margin:9px 0 10px;line-height:1.8}
+.career-mail label{display:block;margin:15px 0 8px;color:#c9d8ee;font-size:14px;line-height:1.65}
+.career-mail input:not([type=checkbox]),.career-mail textarea,.career-mail select{
+  display:block;width:100%;border:1px solid rgba(140,172,221,.29);border-radius:10px;
+  padding:11px 13px;margin-top:7px;background:#0d1b30;color:#edf4ff;
+  box-shadow:inset 0 1px 3px rgba(0,5,16,.12);min-height:44px;
+}
+.career-mail :is(input,textarea)::placeholder{color:#8197b8;opacity:1}
+.career-mail textarea{min-height:140px;resize:vertical;line-height:1.75}
+.career-mail input[type=checkbox]{display:inline-block;vertical-align:middle;width:16px;height:16px;margin:0 9px 3px 0;accent-color:#8ebffc}
+.career-mail form>button{margin:5px 8px 0 0}
+.career-mail .mail-status{min-height:24px;color:#a1dfcf;font-size:14px;overflow-wrap:anywhere;margin-bottom:12px}
+.career-mail .mail-error{color:#ffb5ad}
+.career-mail .mail-note{font-size:13px;color:var(--mail-muted);line-height:1.8}
+.career-mail .mail-settings{margin-top:18px}
+.career-mail .mail-settings summary{cursor:pointer;font-weight:600;color:#dceaff;line-height:1.6;list-style-position:inside}
+.career-mail .mail-settings[open] summary{margin-bottom:14px}
+.career-mail .mail-settings form{max-width:650px}
+.career-mail .mail-unread{font-weight:700;border-color:rgba(124,185,244,.5);color:#d7eeff}
+@media(max-width:720px){
+  .career-mail{padding:14px;border-radius:16px}
+  .career-mail .mail-layout{grid-template-columns:1fr;gap:12px}
+  .career-mail .mail-list{max-height:300px;min-height:100px;overflow:auto}
+  .career-mail :is(.mail-list,.mail-detail,.mail-settings){padding:15px}
+  .career-mail .mail-toolbar strong{margin-left:0}
+  .career-mail input,.career-mail textarea,.career-mail select{font-size:16px}
+}
 ```
 
 ## ④ 测试用例与匿名样例
@@ -9137,6 +10113,725 @@ def test_polish_invalid_json_does_not_change_resume(resume_client,monkeypatch):
     monkeypatch.setattr(model_gateway,'chat',lambda *a,**k:{'text':'{"draft": "bad"}'})
     r=c.post(f'/api/resume/sessions/{sid}/polish',json={'consent':True});assert r.status_code==502
     assert c.get(f'/api/resume/sessions/{sid}').json()['draft']['goal']=='开发'
+```
+
+### `tests/test_account_card.py`
+
+```python
+"""Account presentation and avatar tests use disposable users and synthetic pixels."""
+import io
+import pytest
+from PIL import Image
+from fastapi.testclient import TestClient
+from app.main import app
+from app.database import connect
+
+@pytest.fixture
+def client():
+    with TestClient(app) as c:
+        c.headers['X-CSRF-Token']=c.get('/api/session').json()['csrf_token']
+        yield c
+
+def login(c,name='admin'):
+    r=c.post('/api/auth/login' if name=='admin' else '/api/auth/register',json={'username':name,'password':'admin' if name=='admin' else 'Synthetic-safe-2026!'})
+    assert r.status_code==200
+    c.headers['X-CSRF-Token']=r.json()['csrf_token']
+
+def image():
+    b=io.BytesIO();Image.new('RGB',(420,280),'#517bdc').save(b,'JPEG',exif=b'Exif\x00\x00synthetic-metadata');return b.getvalue()
+
+def test_account_details_save_and_reload(client):
+    login(client)
+    original=client.get('/api/account').json()
+    assert original['username']=='admin' and not original['has_avatar']
+    data={'nickname':'逐光者','city':'杭州','bio':'学习设计，把想法变成作品。'}
+    r=client.put('/api/account',json=data)
+    assert r.status_code==200,r.text
+    for key,value in data.items():assert client.get('/api/account').json()[key]==value
+    assert client.get('/api/auth/me').json()['user']['username']=='admin'
+    assert client.put('/api/account',json={**data,'nickname':'x'*25}).status_code==422
+    assert client.put('/api/account',json={**data,'role':'admin'}).status_code==422
+
+def test_avatar_is_reencoded_private_and_removable(client):
+    login(client)
+    raw=image()
+    r=client.post('/api/account/avatar',content=raw,headers={'Content-Type':'image/jpeg'})
+    assert r.status_code==200,r.text
+    assert r.json()['has_avatar']
+    response=client.get('/api/account/avatar')
+    assert response.headers['content-type']=='image/png'
+    assert 'no-store' in response.headers['cache-control']
+    with Image.open(io.BytesIO(response.content)) as im:
+        assert im.size==(256,256) and not im.getexif()
+    with connect() as db:
+        saved=db.execute('SELECT avatar FROM account_details').fetchone()['avatar']
+        assert raw not in saved and not saved.startswith(b'\x89PNG')
+    assert client.delete('/api/account/avatar').status_code==200
+    assert client.get('/api/account/avatar').status_code==404
+
+def test_account_and_avatar_are_scoped_and_wiped(client):
+    login(client)
+    client.put('/api/account',json={'nickname':'私有昵称','bio':'私有简介','city':''})
+    client.post('/api/account/avatar',content=image(),headers={'Content-Type':'image/jpeg'})
+    login(client,'synthetic-other')
+    assert client.get('/api/account').json()['nickname']==''
+    assert client.get('/api/account/avatar').status_code==404
+    login(client)
+    assert client.delete('/api/profile/data').status_code==200
+    assert client.get('/api/account').json()['nickname']==''
+    assert client.get('/api/account/avatar').status_code==404
+
+@pytest.mark.parametrize('kind,raw',[('image/svg+xml',b'<svg/>'),('image/png',b'not-an-image'),('image/jpeg',b'\xff\xd8\xffbad'),('image/gif',b'GIF89a')])
+def test_avatar_rejects_unsafe_or_invalid_files(client,kind,raw):
+    login(client)
+    assert client.post('/api/account/avatar',content=raw,headers={'Content-Type':kind}).status_code in (415,422)
+
+def test_avatar_requires_auth_csrf_and_size_limit(client):
+    assert client.get('/api/account').status_code==401
+    login(client)
+    assert client.post('/api/account/avatar',content=image(),headers={'X-CSRF-Token':'bad','Content-Type':'image/jpeg'}).status_code==403
+    assert client.post('/api/account/avatar',content=b'x'*(4*1024*1024+1),headers={'Content-Type':'image/jpeg'}).status_code==413
+```
+
+### `tests/test_account_card.mjs`
+
+```text
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const source=fs.readFileSync(new URL('../static/effects.js',import.meta.url),'utf8');
+const upgrade=source.slice(source.indexOf('function upgradeIcons('),source.indexOf('  const visibleObserver'));
+
+test('头像装饰保留用户头像和昵称首字，不替换为通用玻璃图标',()=>{
+  let replacements=0;
+  const el={dataset:{},textContent:'逐',classList:{contains:name=>name==='account-nav-avatar'},matches:selector=>selector!=='svg',querySelectorAll:()=>[],closest:()=>null,replaceChildren(){replacements++;}};
+  const context={newIcon:()=>({})};vm.createContext(context);vm.runInContext(upgrade,context);
+  context.upgradeIcons(el);
+  assert.equal(replacements,0);
+  assert.equal(el.dataset.fxIcon,undefined);
+});
+
+test('资料组件脚本晚于平台就绪时仍加载昵称，不必先打开个人中心',async()=>{
+  const elements=new Map();let requests=0;
+  const el=()=>({textContent:'',classList:{add(){},toggle(){}},append(){},replaceChildren(){},setAttribute(){},querySelectorAll:()=>[],addEventListener(){}});
+  const get=selector=>{if(!elements.has(selector))elements.set(selector,el());return elements.get(selector);};
+  const context={platform:{user:{id:1,username:'synthetic'}},window:{careerPlatformReady:true,addEventListener(){},api:async()=>{requests++;return {nickname:'探索者',city:'',bio:'',created:'2026-11-06',has_avatar:false};}},document:{querySelector:get,createElement:el,body:{append(){}}}};
+  vm.createContext(context);vm.runInContext(fs.readFileSync(new URL('../static/account-card.js',import.meta.url),'utf8'),context);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(requests,1);assert.equal(get('#account-top').textContent,'探索者');
+});
+```
+
+### `tests/test_admin_pages.mjs`
+
+```text
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+import {readFileSync} from 'node:fs';
+import vm from 'node:vm';
+const require=createRequire(import.meta.url),router=require('../static/admin-pages.js');
+const source=readFileSync(new URL('../static/admin-pages.js',import.meta.url),'utf8');
+class Element{
+  constructor(data={}){this.dataset=data;this.children=[];this.attributes={};this.hidden=false;this.classes=new Set();this.classList={toggle:(name,on)=>on?this.classes.add(name):this.classes.delete(name)};this.handlers={};}
+  append(...children){this.children.push(...children);}
+  replaceChildren(...children){this.children=children;}
+  setAttribute(name,value){this.attributes[name]=value;}
+  removeAttribute(name){delete this.attributes[name];}
+  addEventListener(name,fn){this.handlers[name]=fn;}
+  focus(){this.focused=true;}
+}
+function fixture(href='http://local/admin?page=users'){
+  const nav=new Element(),main=new Element(),nodes=Object.fromEntries(['admin-page-title','admin-page-description','admin-page-eyebrow','admin-breadcrumb'].map(id=>[id,new Element()]));
+  const panels=Object.keys(router.pages).map(page=>new Element({adminPage:page}));
+  const modelsHost=new Element({adminPage:'models knowledge'});panels.push(modelsHost);
+  const location=new URL(href),events={},entries=[];
+  const document={title:'',querySelector:()=>nav,querySelectorAll:selector=>selector==='[data-admin-page]'?panels:nav.children,createElement:()=>new Element(),createElementNS:()=>new Element(),getElementById:id=>id==='admin-main'?main:nodes[id]};
+  const history=Object.fromEntries(['pushState','replaceState'].map(method=>[method,(_,__,url)=>{entries.push({method,url});location.href=new URL(url,location).href;}]));
+  const window={addEventListener:(name,fn)=>events[name]=fn,scrollTo:()=>{}};
+  vm.runInNewContext(source,{window,document,location,history,URL});
+  return {api:window.AdminPages,nav,panels,modelsHost,document,location,history,events,entries,nodes};
+}
+test('all nine direct links resolve; unknown and inherited object keys safely fall back',()=>{
+  assert.equal(Object.keys(router.pages).length,9);
+  for(const name of Object.keys(router.pages))assert.equal(router.resolve('/admin?page='+name),name);
+  for(const name of ['bad','toString','__proto__'])assert.equal(router.resolve('/admin?page='+name),'overview');
+  assert.equal(router.resolve('/admin#admin-security'),'security');
+  assert.equal(router.resolve('/admin?page=users#admin-security'),'users');
+  assert.equal(router.pageURL('/admin?source=bookmark#old','knowledge'),'/admin?source=bookmark&page=knowledge');
+});
+test('direct load shows one page, real navigation links and correct active title',()=>{
+  const f=fixture();f.api.init();
+  assert.deepEqual(f.panels.filter(p=>!p.hidden).map(p=>p.dataset.adminPage),['users']);
+  assert.equal(f.nav.children.length,9);
+  assert.equal(f.nav.children.find(l=>l.dataset.adminRoute==='users').attributes['aria-current'],'page');
+  assert.equal(f.document.title,'用户管理 · 职安管理控制台');
+  for(const link of f.nav.children){assert.match(link.href,/^\/admin\?page=/);assert.equal(link.children[0].children[0].attributes.href,'#i-'+router.pages[link.dataset.adminRoute][3]);}
+});
+test('navigation preserves nodes and form state, while back/forward restores route and title',()=>{
+  const f=fixture();f.api.init();f.panels[1].unsavedInput='保留编辑';
+  f.api.go('knowledge');
+  assert.equal(f.location.search,'?page=knowledge');assert.equal(f.modelsHost.hidden,false);
+  assert.equal(f.panels.find(p=>p.dataset.adminPage==='models').hidden,true);
+  assert.equal(f.panels.find(p=>p.dataset.adminPage==='knowledge').hidden,false);
+  assert.equal(f.entries.at(-1).method,'pushState');
+  f.location.href='http://local/admin?page=users';f.events.popstate();
+  assert.equal(f.panels[1].hidden,false);assert.equal(f.panels[1].unsavedInput,'保留编辑');
+  assert.equal(f.nodes['admin-page-title'].textContent,'用户管理');assert.equal(f.nodes['admin-page-title'].focused,true);
+  f.location.href='http://local/admin?page=models';f.events.popstate();
+  assert.equal(f.panels.find(p=>p.dataset.adminPage==='knowledge').hidden,true);
+  assert.equal(f.panels.find(p=>p.dataset.adminPage==='models').hidden,false);
+});
+test('normal clicks route locally; modifier clicks keep native new-tab behavior',()=>{
+  const f=fixture();f.api.init();const link=f.nav.children.find(l=>l.dataset.adminRoute==='reviews');let prevented=false;
+  const event={target:{closest:()=>link},button:0,preventDefault:()=>prevented=true};
+  f.nav.handlers.click({...event,ctrlKey:true});assert.equal(prevented,false);assert.equal(f.location.search,'?page=users');
+  f.nav.handlers.click(event);assert.equal(prevented,true);assert.equal(f.location.search,'?page=reviews');
+});
+test('initial invalid routes are normalized without an extra history entry; init is idempotent',()=>{
+  const f=fixture('http://local/admin?page=missing#old');f.api.init();f.api.init();
+  assert.equal(f.location.search,'?page=overview');assert.equal(f.location.hash,'');
+  assert.equal(f.entries.length,1);assert.equal(f.entries[0].method,'replaceState');assert.equal(f.nav.children.length,9);
+});
+```
+
+### `tests/test_company_pages.mjs`
+
+```text
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import vm from 'node:vm';
+const source=readFileSync(new URL('../static/company.js',import.meta.url),'utf8');
+class Element{
+ constructor(dataset={}){this.dataset=dataset;this.children=[];this.attributes={};this.hidden=false;this.classList={toggle:()=>{}};}
+ setAttribute(k,v){this.attributes[k]=v;}
+ removeAttribute(k){delete this.attributes[k];}
+ append(...children){this.children.push(...children);}
+ prepend(...children){this.children.unshift(...children);}
+ replaceChildren(...children){this.children=children;}
+}
+function fixture(){
+ const keys=['overview','jobs','publish','candidates','mail'];
+ const panels=keys.map(companyView=>new Element({companyView})),nav=keys.map(companyNav=>{const a=new Element({companyNav});a.orbit=new Element();a.querySelector=()=>a.orbit;return a;}),brand=new Element(),title=new Element(),location={pathname:'/company/jobs'},history=[];
+ const document={querySelectorAll:s=>s==='[data-company-view]'?panels:nav,querySelector:s=>s==='.company-sidebar .site-brand'?brand:title,createElementNS:(_,tag)=>new Element({tag})};
+ const context={$:s=>document.querySelector(s),document,location,history:{pushState:(_,__,url)=>history.push(url)}};
+ vm.createContext(context);const routing=source.slice(source.indexOf('function page()'),source.indexOf('function reset()'));vm.runInContext(routing,context);
+ return {...context,panels,nav,brand,title,history};
+}
+test('company navigation preserves unsaved form state and displays only selected page',()=>{
+ const f=fixture();f.panels[2].draft='未提交的岗位';f.show(f.page(),false);
+ assert.deepEqual(f.panels.filter(p=>!p.hidden).map(p=>p.dataset.companyView),['jobs']);
+ assert.equal(f.nav[1].attributes['aria-current'],'page');
+ f.show('publish');assert.equal(f.history.at(-1),'/company/publish');assert.equal(f.panels[2].draft,'未提交的岗位');
+ f.show('toString',false);assert.equal(f.panels[0].hidden,false);
+});
+test('company icon mounting supplies SVG uses recognized by the existing glass atlas',()=>{
+ const f=fixture();assert.equal(typeof f.mountIcons,'function','company glass icon mount is missing');f.mountIcons();
+ for(const a of f.nav){assert.equal(a.orbit.children[0].dataset.tag,'svg');assert.match(a.orbit.children[0].children[0].attributes.href,/^#i-(grid|list|upload|user|file)$/);}
+ assert.equal(f.brand.children[0].children[0].attributes.href,'#i-shield');
+});
+
+test('refresh clears previously opened resume before checking current authorization, including failures',async()=>{
+ const list=new Element();list.append(new Element({resume:'previously-authorized'}));
+ const context={$:()=>list,el:(_,text)=>({textContent:text}),candidateData:{items:[{resume:'private'}],jobs:[]},api:async()=>{throw Error('权限已失效');}};
+ vm.createContext(context);vm.runInContext(source.slice(source.indexOf('async function refresh()'),source.indexOf('async function start()')),context);
+ await assert.rejects(context.refresh(),/权限已失效/);
+ assert.equal(context.candidateData.items.length,0);
+ assert.equal(list.children.length,1);
+ assert.match(list.children[0].textContent,/校验/);
+ assert.equal(list.children[0].dataset,undefined);
+});
+```
+
+### `tests/test_recruitment.py`
+
+```python
+"""Recruitment consent and company scoping without model calls."""
+import importlib.util
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from app import database
+from app.api import router as base
+from app.platform_api import router as platform
+
+
+def test_recruitment_module_exists():
+    assert importlib.util.find_spec('app.recruitment_api') is not None, 'Recruitment consent API is missing'
+
+
+@pytest.fixture
+def client(monkeypatch):
+    if importlib.util.find_spec('app.recruitment_api') is None:pytest.skip('API not implemented')
+    from app.recruitment_api import router
+    from app.services.recruitment_schema import SCHEMA
+    monkeypatch.setattr(database,'SCHEMA',database.SCHEMA+SCHEMA)
+    app=FastAPI();app.include_router(base);app.include_router(platform);app.include_router(router)
+    with TestClient(app) as c:
+        c.headers['X-CSRF-Token']=c.get('/api/auth/session').json()['csrf_token']
+        r=c.post('/api/auth/register',json={'username':'applicant','password':'Testing-safe-2026!'})
+        c.headers['X-CSRF-Token']=r.json()['csrf_token']
+        uid=r.json()['user']['id']
+        with database.connect() as db:
+            company_user=db.execute("INSERT INTO users(username,password,role) VALUES ('employer','unused','company')").lastrowid
+            cid=db.execute("INSERT INTO companies(name,credit_code,contact_role,license_encrypted,license_type,ocr_notes,status) VALUES ('企业','91350211M000100Y43','经理',X'01','image/png','{}','approved')").lastrowid
+            db.execute('INSERT INTO company_memberships(company_id,user_id) VALUES (?,?)',(cid,company_user))
+            jid=db.execute("INSERT INTO jobs(owner_id,title,company,description,status) VALUES (?,'后端开发','企业','Python 岗位说明','approved')",(company_user,)).lastrowid
+            db.execute('INSERT INTO job_company_links VALUES (?,?)',(jid,cid))
+        c.uid=uid;c.jid=jid;c.cid=cid;c.company_user=company_user
+        yield c
+
+
+def apply(c,**updates):
+    c.put('/api/profile',json={'occupation':'后端','resume':'真实技能 Python 项目经历'})
+    return c.post(f'/api/jobs/{c.jid}/apply',json={'resume_source':'profile','share_resume':True,**updates})
+
+
+def test_explicit_consent_snapshot_and_idempotence(client):
+    c=client
+    assert apply(c,share_resume=False).status_code==422
+    r=apply(c);assert r.status_code==200,r.text
+    aid=r.json()['id'];assert apply(c).json()['id']==aid
+    with database.connect() as db:
+        row=db.execute('SELECT * FROM job_applications WHERE id=?',(aid,)).fetchone()
+        assert b'Python' not in row['resume_encrypted']
+        assert db.execute('SELECT COUNT(*) FROM application_interviews').fetchone()[0]==0
+    assert c.get('/api/applications').json()['items'][0]['id']==aid
+    assert c.get('/api/company/candidates').status_code==403
+    assert c.delete(f'/api/applications/{aid}').status_code==200
+    with database.connect() as db:
+        assert db.execute('SELECT resume_encrypted FROM job_applications WHERE id=?',(aid,)).fetchone()[0] is None
+
+
+def test_server_only_interview_links_and_company_scope(client):
+    from app.recruitment_api import attach_interview,candidate_view,validate_application
+    from fastapi import HTTPException
+    c=client;aid=apply(c,interview_consent=True).json()['id']
+    with database.connect() as db:
+        user=dict(db.execute('SELECT * FROM users WHERE id=?',(c.uid,)).fetchone())
+        iid=db.execute("INSERT INTO interviews(user_id,occupation) VALUES (?,'后端开发')",(c.uid,)).lastrowid
+        with pytest.raises(HTTPException):attach_interview(db,user,aid,iid,'伪造职业')
+        attach_interview(db,user,aid,iid,'后端开发')
+        attach_interview(db,user,aid,iid,'后端开发')
+        company=dict(db.execute('SELECT * FROM companies WHERE id=?',(c.cid,)).fetchone())
+        result=candidate_view(db,company,aid)
+        assert result['interview_count']==1
+        assert 'Python' in result['resume']['text']
+        assert 'history' not in result and 'score' not in result
+        with pytest.raises(HTTPException):candidate_view(db,{'id':999},aid)
+        db.execute("UPDATE companies SET status='rejected' WHERE id=?",(c.cid,))
+        with pytest.raises(HTTPException):validate_application(db,user,aid,'后端开发')
+
+
+def test_draft_ownership_and_actual_resume_only(client):
+    from app.resume_api import encrypted
+    c=client
+    with database.connect() as db:
+        db.execute('INSERT INTO resume_sessions(id,user_id,content) VALUES (?,?,?)',('owned',c.uid,encrypted({'draft':{'skills':'事实技能'},'messages':[{'content':'私密对话'}],'proposal':{'draft':{'skills':'AI建议'}}})))
+    body={'resume_source':'studio','resume_session_id':'owned','share_resume':True}
+    r=c.post(f'/api/jobs/{c.jid}/apply',json=body);assert r.status_code==200,r.text
+    with database.connect() as db:
+        row=db.execute('SELECT resume_encrypted FROM job_applications').fetchone()
+        value=database.cipher().decrypt(row[0]).decode()
+        assert '事实技能' in value and '私密对话' not in value and 'AI建议' not in value
+    assert c.post(f'/api/jobs/{c.jid}/apply',json={**body,'resume_session_id':'not-owned'}).status_code==404
+
+
+
+def test_delete_personal_data_revokes_all_shared_snapshots(client):
+    from app.recruitment_api import clear_user_applications
+    c=client;aid=apply(c).json()['id']
+    with database.connect() as db:
+        clear_user_applications(db,c.uid)
+        row=db.execute('SELECT status,share_resume,resume_encrypted FROM job_applications WHERE id=?',(aid,)).fetchone()
+        assert tuple(row)==('withdrawn',0,None)
+
+
+def test_pending_job_cannot_receive_application(client):
+    c=client
+    with database.connect() as db:db.execute("UPDATE jobs SET status='pending' WHERE id=?",(c.jid,))
+    assert apply(c).status_code==404
+
+
+def test_company_api_only_returns_own_authorized_candidate(client,monkeypatch):
+    import app.recruitment_api as api
+    c=client;aid=apply(c).json()['id']
+    with database.connect() as db:user=dict(db.execute('SELECT * FROM users WHERE id=?',(c.company_user,)).fetchone())
+    monkeypatch.setattr(api,'current',lambda request:user)
+    result=c.get('/api/company/candidates');assert result.status_code==200,result.text
+    assert result.json()['items'][0]['id']==aid
+    assert result.json()['jobs'][0]['interview_users']==0
+    assert c.get('/api/company/candidates?job_id=999').status_code==404
+    assert c.get('/api/company/candidates/999').status_code==404
+    with database.connect() as db:db.execute("UPDATE companies SET status='pending' WHERE id=?",(c.cid,))
+    assert c.get(f'/api/company/candidates/{aid}').status_code==403
+
+
+def test_interview_endpoint_uses_authorized_job_and_counts_once(client,monkeypatch):
+    from app.services import growth
+    c=client;aid=apply(c,interview_consent=True).json()['id'];evidence=[]
+    def answer(task,data,schema):
+        evidence.append(data)
+        return {'question':'介绍一个真实项目。','feedback':'','focus':'项目实践'}
+    monkeypatch.setattr(growth,'generate_json',answer)
+    r=c.post('/api/interviews',json={'occupation':'后端开发','jd':'替换后的无关岗位','consent':True,'application_id':aid})
+    assert r.status_code==200,r.text
+    assert evidence[0]['jd']=='Python 岗位说明'
+    with database.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM application_interviews WHERE application_id=?',(aid,)).fetchone()[0]==1
+    c.delete(f'/api/applications/{aid}')
+    r=c.post('/api/interviews',json={'occupation':'后端开发','consent':True,'application_id':aid})
+    assert r.status_code==404 and len(evidence)==1
+
+
+def test_withdraw_during_model_call_cannot_create_interview_link(client,monkeypatch):
+    from app.services import growth
+    c=client;aid=apply(c,interview_consent=True).json()['id']
+    def withdraw_then_reply(*args):
+        with database.connect() as db:
+            db.execute("UPDATE job_applications SET status='withdrawn',share_resume=0,resume_encrypted=NULL WHERE id=?",(aid,))
+        return {'question':'合成问题','feedback':'','focus':'技能'}
+    monkeypatch.setattr(growth,'generate_json',withdraw_then_reply)
+    r=c.post('/api/interviews',json={'occupation':'后端开发','consent':True,'application_id':aid})
+    assert r.status_code==404
+    with database.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM interviews').fetchone()[0]==0
+        assert db.execute('SELECT COUNT(*) FROM application_interviews').fetchone()[0]==0
+
+
+def test_personal_data_endpoint_revokes_shared_resume(client):
+    c=client;aid=apply(c,interview_consent=True).json()['id']
+    assert c.delete('/api/profile/data').status_code==200
+    with database.connect() as db:
+        row=db.execute('SELECT status,resume_encrypted FROM job_applications WHERE id=?',(aid,)).fetchone()
+        assert tuple(row)==('withdrawn',None)
+
+
+def test_reapplication_without_interview_consent_hides_previous_training(client,monkeypatch):
+    import app.recruitment_api as api
+    c=client;aid=apply(c,interview_consent=True).json()['id']
+    with database.connect() as db:
+        user=dict(db.execute('SELECT * FROM users WHERE id=?',(c.uid,)).fetchone())
+        iid=db.execute("INSERT INTO interviews(user_id,occupation) VALUES (?,'后端开发')",(c.uid,)).lastrowid
+        api.attach_interview(db,user,aid,iid,'后端开发')
+    assert c.delete(f'/api/applications/{aid}').status_code==200
+    assert apply(c,interview_consent=False).json()['id']==aid
+    with database.connect() as db:
+        company=dict(db.execute('SELECT * FROM companies WHERE id=?',(c.cid,)).fetchone())
+        assert api.candidate_view(db,company,aid)['interview_count']==0
+        employer=dict(db.execute('SELECT * FROM users WHERE id=?',(c.company_user,)).fetchone())
+    monkeypatch.setattr(api,'current',lambda request:employer)
+    result=c.get('/api/company/candidates').json()
+    assert result['jobs'][0]['applicant_count']==1
+    assert result['jobs'][0]['interview_users']==0
+```
+
+### `tests/test_recruitment_bridge.mjs`
+
+```text
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const source=fs.readFileSync(new URL('../static/recruitment-bridge.js',import.meta.url),'utf8');
+const prepare=source.slice(source.indexOf('function prepare('),source.indexOf('  async function initMail('));
+function setup(){
+  const fields=new Map();const get=id=>{if(!fields.has(id))fields.set(id,{value:'old',checked:true,hidden:false,replaceChildren(){this.cleared=true;}});return fields.get(id);};
+  const context={platform:{interviewEpoch:2,interview:{id:4}},document:{querySelector:get},window:{CameraAssist:{stop(){}}},stopVoice(){},show(view){context.view=view;},toast(){}};
+  vm.createContext(context);vm.runInContext(prepare,context);return {context,get};
+}
+test('一键岗位面试填入岗位并关闭旧媒体、清除旧对话，AI授权必须重新勾选',()=>{
+  const {context,get}=setup();context.prepare({application_id:8,occupation:'后端开发',jd:'Python',job:{id:2}});
+  assert.equal(context.platform.applicationId,8);assert.equal(context.platform.interview,null);assert.equal(context.platform.interviewEpoch,3);
+  assert.equal(get('#interview-occupation').value,'后端开发');assert.equal(get('#interview-jd').value,'Python');assert.equal(get('#interview-consent').checked,false);
+  assert.equal(get('#interview-messages').cleared,true);assert.equal(get('#interview-application-note').hidden,false);assert.equal(context.view,'interview');
+});
+test('个人练习不共享企业履历；非法application id不能准备表单',()=>{
+  const {context,get}=setup();context.prepare({application_id:null,occupation:'开发',jd:'岗位要求'});
+  assert.equal(get('#interview-application-note').hidden,true);assert.equal(context.platform.applicationId,null);
+  context.prepare({application_id:'8',occupation:'错误',jd:'错误'});assert.equal(get('#interview-occupation').value,'开发');
+});
+```
+
+### `tests/test_mail.py`
+
+```python
+"""Offline station-mail authorization and delivery contracts."""
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from app import database
+from app.api import router as base_router
+from app.platform_api import router as platform_router
+
+@pytest.fixture
+def mailbox(monkeypatch):
+    from app.mail_api import router
+    from app.services.mail_schema import SCHEMA
+    from app.services.recruitment_schema import SCHEMA as RECRUITMENT_SCHEMA
+    monkeypatch.setattr(database,'SCHEMA',database.SCHEMA+RECRUITMENT_SCHEMA+SCHEMA)
+    with database.connect() as db:
+        for uid,role in [(1,'company'),(2,'user'),(3,'user'),(4,'company'),(5,'admin')]:
+            db.execute('INSERT INTO users(id,username,password,role) VALUES (?,?,?,?)',(uid,'actor'+str(uid),'unused',role))
+        db.execute("INSERT INTO companies(id,name,credit_code,contact_role,status,license_encrypted,license_type,ocr_notes) VALUES (1,'合成公司','test','HR','approved',X'00','png','{}')")
+        db.execute('INSERT INTO company_memberships(company_id,user_id) VALUES (1,1)')
+        db.execute("INSERT INTO jobs(id,owner_id,title,company,description,status) VALUES (1,1,'开发','公司','职责','approved')")
+        db.execute('INSERT INTO job_company_links VALUES (1,1)')
+        db.execute("INSERT INTO job_applications(id,user_id,job_id,share_resume,company_id,status,resume_source,occupation,jd) VALUES (1,2,1,1,1,'active','profile','开发','岗位'),(2,3,1,0,1,'active','profile','开发','岗位')")
+    app=FastAPI();app.include_router(base_router);app.include_router(platform_router);app.include_router(router)
+    with TestClient(app) as c:
+        def login(uid):
+            import hashlib,time
+            token='mail-test-'+str(uid)
+            with database.connect() as db:
+                db.execute('INSERT OR REPLACE INTO auth_sessions VALUES (?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),uid,int(time.time())+600))
+            c.cookies.set('cg_auth',token)
+            c.headers['X-CSRF-Token']=c.get('/api/auth/session').json()['csrf_token']
+        yield c,login
+
+def test_mail_module_exists():
+    from app import mail_api
+    assert mail_api.router
+
+def test_company_send_scoped_and_encrypted(mailbox):
+    c,login=mailbox;login(1)
+    r=c.post('/api/mail/threads',json={'application_id':1,'subject':'意向询问','body':'请确认应聘意向'})
+    assert r.status_code==200,r.text
+    tid=r.json()['id']
+    assert c.post('/api/mail/threads',json={'application_id':2,'subject':'询问','body':'你好'}).status_code==403
+    assert c.post('/api/mail/threads',json={'application_id':1,'recipient_id':3,'subject':'询问','body':'你好'}).status_code==422
+    with database.connect() as db:
+        stored=db.execute('SELECT body_encrypted FROM mail_messages').fetchone()[0]
+        assert b'\xe8\xaf\xb7' not in stored
+        assert database.cipher().decrypt(stored).decode()=='请确认应聘意向'
+    login(4);assert c.get(f'/api/mail/threads/{tid}').status_code==404
+    assert c.post('/api/mail/threads',json={'application_id':1,'subject':'询问','body':'你好'}).status_code==403
+
+def test_inbox_get_no_read_reply_csrf_and_events(mailbox):
+    c,login=mailbox;login(1)
+    tid=c.post('/api/mail/threads',json={'application_id':1,'subject':'询问','body':'你好'}).json()['id']
+    login(2)
+    assert c.get('/api/mail/inbox').json()['unread']==1
+    assert c.get(f'/api/mail/threads/{tid}').json()['messages'][0]['body']=='你好'
+    assert c.get('/api/mail/inbox').json()['unread']==1
+    assert c.get('/api/mail/events?after=0&timeout=0').json()['unread']==1
+    assert c.post('/api/mail/threads',json={'application_id':1,'subject':'越权','body':'你好'}).status_code==403
+    token=c.headers.pop('X-CSRF-Token')
+    assert c.post(f'/api/mail/threads/{tid}/read').status_code==403
+    c.headers['X-CSRF-Token']=token
+    assert c.post(f'/api/mail/threads/{tid}/read').status_code==200
+    assert c.get('/api/mail/inbox').json()['unread']==0
+    assert c.post(f'/api/mail/threads/{tid}/reply',json={'body':'愿意了解'}).status_code==200
+    login(1);assert c.get('/api/mail/inbox').json()['unread']==1
+    assert len(c.get('/api/mail/sent').json()['items'])==1
+    login(3);assert c.post(f'/api/mail/threads/{tid}/reply',json={'body':'越权'}).status_code==404
+
+def test_admin_notification_rate_and_mailbox_pending(mailbox):
+    c,login=mailbox;login(5)
+    assert c.post('/api/mail/threads',json={'recipient_id':2,'subject':'通知','body':'系统维护'}).status_code==200
+    assert c.post('/api/mail/threads',json={'recipient_id':999,'subject':'通知','body':'你好'}).status_code==404
+    assert c.post('/api/admin/mail/config',json={'host':'127.0.0.1','port':587,'username':'a','password':'b','from_address':'test@example.com'}).status_code==422
+    login(2)
+    r=c.post('/api/mail/address',json={'email':'person@example.com'})
+    assert r.status_code==200 and r.json()['verified'] is False
+    assert c.get('/api/mail/address').json()['outbound_available'] is False
+    for _ in range(21):
+        response=c.post('/api/mail/threads/1/reply',json={'body':'测试'})
+    assert response.status_code==429
+
+
+
+def test_verified_opt_in_smtp_delivery_and_failure(mailbox,monkeypatch):
+    from app.services import mail
+    c,login=mailbox;sent=[]
+    monkeypatch.setattr(mail,'send_email',lambda conf,to,subject,body:sent.append((to,subject,body)))
+    login(5)
+    config={'host':'smtp.qq.com','port':587,'username':'test','password':'secret','from_address':'sender@example.com','enabled':True}
+    assert c.post('/api/admin/mail/config',json=config).status_code==200
+    assert not sent
+    response=c.get('/api/admin/mail/config').json()
+    assert 'password' not in response and response['password_configured']
+    login(2)
+    c.post('/api/mail/address',json={'email':'person@example.com','consent':True})
+    assert c.post('/api/mail/address/send-code').json()['sent']
+    code=sent[-1][2].split('：')[1].split('，')[0]
+    assert c.post('/api/mail/address/verify',json={'code':'wrong'}).status_code==422
+    assert c.post('/api/mail/address/verify',json={'code':code}).json()['verified']
+    assert c.post('/api/mail/address/verify',json={'code':code}).status_code==422
+    login(1)
+    r=c.post('/api/mail/threads',json={'application_id':1,'subject':'联系','body':'职业机会','sync_email':True})
+    assert r.json()['delivery']=='email_sent'
+    assert sent[-1][0]=='person@example.com'
+    def broken(*args):raise OSError('synthetic failure')
+    monkeypatch.setattr(mail,'send_email',broken)
+    r=c.post('/api/mail/threads',json={'application_id':1,'subject':'联系','body':'仍保留站内','sync_email':True})
+    assert r.json()['delivery']=='email_failed' and r.json()['internal_delivered']
+    login(2);assert c.get('/api/mail/inbox').json()['unread']==2
+    c.post('/api/mail/address',json={'email':'new@example.com','consent':True})
+    assert c.get('/api/mail/address').json()['verified'] is False
+
+def test_smtp_rejects_private_dns_before_transport(monkeypatch):
+    import socket
+    from app.services import mail
+    config={'host':'smtp.qq.com','port':587,'username':'test','password':'secret','from_address':'sender@example.com','enabled':True}
+    monkeypatch.setattr(socket,'getaddrinfo',lambda *a,**k:[(socket.AF_INET,socket.SOCK_STREAM,6,'',('127.0.0.1',587))])
+    with pytest.raises(ValueError,match='Nonpublic'):mail.send_email(config,'test@example.com','subject','body')
+
+def test_revoked_application_cannot_receive_company_reply(mailbox):
+    c,login=mailbox;login(1)
+    tid=c.post('/api/mail/threads',json={'application_id':1,'subject':'联系','body':'你好'}).json()['id']
+    with database.connect() as db:db.execute("UPDATE job_applications SET status='withdrawn' WHERE id=1")
+    assert c.post(f'/api/mail/threads/{tid}/reply',json={'body':'继续联系'}).status_code==403
+    assert c.post('/api/mail/threads',json={'application_id':1,'subject':'联系','body':'你好'}).status_code==403
+
+def test_smtp_pins_public_address_and_requires_starttls(monkeypatch):
+    import socket
+    from app.services import mail
+    calls=[]
+    monkeypatch.setattr(socket,'getaddrinfo',lambda *a,**k:[(socket.AF_INET,socket.SOCK_STREAM,6,'',('8.8.8.8',587))])
+    monkeypatch.setattr(socket,'create_connection',lambda dest,timeout:calls.append(('socket',dest)) or object())
+    class Transport:
+        def __init__(self,*a,**k):pass
+        def __enter__(self):return self
+        def __exit__(self,*args):pass
+        def connect(self,host,port):self._get_socket(host,port,12)
+        def ehlo(self):calls.append(('ehlo',))
+        def starttls(self,context):calls.append(('tls',self._host))
+        def login(self,*args):calls.append(('login',))
+        def send_message(self,message):calls.append(('message',message['To']))
+    monkeypatch.setattr(mail.smtplib,'SMTP',Transport)
+    mail.send_email({'host':'smtp.qq.com','port':587,'username':'x','password':'y','from_address':'sender@example.com','enabled':True},'recipient@example.com','主题','正文')
+    assert calls[0]==('socket',('8.8.8.8',587))
+    assert calls.index(('tls','smtp.qq.com'))<calls.index(('login',))
+    assert calls[-1]==('message','recipient@example.com')
+
+def test_subject_headers_and_verification_attempt_limit(mailbox,monkeypatch):
+    from app.services import mail
+    c,login=mailbox;login(5)
+    assert c.post('/api/mail/threads',json={'recipient_id':2,'subject':'a\r\nBcc:x@example.com','body':'正文'}).status_code==422
+    monkeypatch.setattr(mail,'send_email',lambda *args:None)
+    c.post('/api/admin/mail/config',json={'host':'smtp.qq.com','port':587,'username':'x','password':'y','from_address':'a@example.com','enabled':True})
+    login(2);c.post('/api/mail/address',json={'email':'b@example.com','consent':True});c.post('/api/mail/address/send-code')
+    import hashlib,time
+    with database.connect() as db:
+        db.execute('UPDATE mail_addresses SET code_hash=?,code_expires=? WHERE user_id=2',(hashlib.sha256(b'2:123456').hexdigest(),int(time.time())+600))
+    for _ in range(5):assert c.post('/api/mail/address/verify',json={'code':'000000'}).status_code==422
+    assert c.post('/api/mail/address/verify',json={'code':'123456'}).status_code==422
+
+
+def test_stale_identity_cannot_create_mail_after_data_reset(mailbox,monkeypatch):
+    import app.mail_api as module
+    c,login=mailbox;login(1);original=module.current
+    def stale(request,*args):
+        user=original(request,*args)
+        with database.connect() as db:db.execute('UPDATE users SET data_generation=data_generation+1 WHERE id=?',(user['id'],))
+        return user
+    monkeypatch.setattr(module,'current',stale)
+    assert c.post('/api/mail/threads',json={'application_id':1,'subject':'联系','body':'过期请求'}).status_code==409
+
+def test_mail_audit_contains_only_actions(mailbox,monkeypatch):
+    from app.services import mail
+    c,login=mailbox;login(5)
+    c.post('/api/admin/mail/config',json={'host':'smtp.qq.com','port':587,'username':'x','password':'private-pass','from_address':'sender@example.com','enabled':True})
+    login(1);tid=c.post('/api/mail/threads',json={'application_id':1,'subject':'private-subject','body':'private-body'}).json()['id']
+    login(2);c.post(f'/api/mail/threads/{tid}/read');c.post(f'/api/mail/threads/{tid}/reply',json={'body':'private-reply'})
+    c.post('/api/mail/address',json={'email':'private@example.com','consent':True})
+    monkeypatch.setattr(mail,'send_email',lambda *args:None)
+    c.post('/api/mail/address/send-code')
+    with database.connect() as db:
+        actions=[r[0] for r in db.execute('SELECT action FROM events')]
+    assert {'mail_send','mail_reply','mail_read','mail_address_save','mail_smtp_save','mail_smtp_enabled','mail_code_sent','mail_delivery_internal'}<=set(actions)
+    assert not any('private' in action or '@' in action for action in actions)
+
+def test_failed_old_code_send_does_not_clear_new_code(mailbox,monkeypatch):
+    from app.services import mail
+    c,login=mailbox;login(5)
+    c.post('/api/admin/mail/config',json={'host':'smtp.qq.com','port':587,'username':'x','password':'y','from_address':'sender@example.com','enabled':True})
+    login(2);c.post('/api/mail/address',json={'email':'person@example.com'})
+    def racing(*args):
+        with database.connect() as db:db.execute("UPDATE mail_addresses SET code_hash='newer-digest' WHERE user_id=2")
+        raise OSError('private transport details')
+    monkeypatch.setattr(mail,'send_email',racing)
+    response=c.post('/api/mail/address/send-code');assert response.status_code==502
+    with database.connect() as db:
+        assert db.execute('SELECT code_hash FROM mail_addresses WHERE user_id=2').fetchone()[0]=='newer-digest'
+        assert db.execute("SELECT 1 FROM events WHERE action='mail_code_failed'").fetchone()
+
+@pytest.mark.parametrize('change',["disabled=1","data_generation=data_generation+1"])
+def test_longpoll_stops_after_account_change(mailbox,monkeypatch,change):
+    import asyncio
+    from fastapi import HTTPException
+    import app.mail_api as module
+    c,login=mailbox;login(2)
+    with database.connect() as db:user=dict(db.execute('SELECT * FROM users WHERE id=2').fetchone())
+    monkeypatch.setattr(module,'current',lambda request:user)
+    original=asyncio.sleep
+    async def changed(_):
+        with database.connect() as db:db.execute('UPDATE users SET '+change+' WHERE id=2')
+        await original(0)
+    monkeypatch.setattr(module.asyncio,'sleep',changed)
+    class Request:
+        async def is_disconnected(self):return False
+    with pytest.raises(HTTPException) as exc:asyncio.run(module.events(Request(),after=0,timeout=.05))
+    assert exc.value.status_code in (401,409)
+
+def test_mail_ui_reinitialization_ignores_stale_address_and_emits_state(tmp_path):
+    import subprocess
+    from pathlib import Path
+    script=r'''
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+class E{constructor(tag){this.tag=tag;this.children=[];this.dataset={};this.className='';this.classList={add:()=>{},toggle:()=>{}};this.isConnected=true;}
+append(...e){this.children.push(...e);}prepend(e){this.children.unshift(e);}replaceChildren(...e){this.children=e;}setAttribute(){}focus(){}
+querySelector(s){return this.children.find(e=>s==='[data-unread]'?Object.hasOwn(e.dataset,'unread'):e.className===s.slice(1))||this.children.map(e=>e.querySelector(s)).find(Boolean)||null;}}
+let state=[],timers=[],addressCalls=0,release,waiting;
+global.window={dispatchEvent:e=>state.push(e.detail)};global.CustomEvent=class{constructor(name,options){this.detail=options.detail;}};
+global.document={createElement:t=>new E(t)};global.setTimeout=f=>(timers.push(f),timers.length);global.clearTimeout=()=>{};
+global.fetch=async(path,options)=>({ok:true,json:async()=>{
+ if(path.endsWith('/auth/session'))return {csrf_token:'token'};
+ if(path.endsWith('/auth/me'))return {user:{role:'user'}};
+ if(path.includes('/mail/inbox'))return {items:[],cursor:0,unread:1};
+ if(path.includes('/mail/events'))return {cursor:0,unread:2};
+ if(path.endsWith('/mail/address')){addressCalls++;if(addressCalls===1)return await new Promise(resolve=>{release=()=>resolve({email:'stale@example.com',verified:true});waiting();});return {email:'',verified:false};}
+ throw Error(path);
+}});
+vm.runInThisContext(fs.readFileSync(process.argv[2],'utf8'));
+(async()=>{let ready=new Promise(r=>waiting=r),a=new E('div'),b=new E('div');const old=window.CareerMail.init(a);await ready;await window.CareerMail.init(b);release();await old;
+ const all=e=>[e,...e.children.flatMap(all)];assert(!all(b).some(e=>e.value==='stale@example.com'));assert.equal(all(b).filter(e=>e.className==='mail-settings').length,1);
+ assert(state.some(x=>x.unread===1));await timers.at(-1)();assert(state.some(x=>x.unread===2));
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+    harness=tmp_path/'mail-ui-check.cjs';harness.write_text(script,encoding='utf-8')
+    result=subprocess.run(['node',str(harness),str(Path('static/mail-ui.js').resolve())],capture_output=True,text=True,timeout=10)
+    assert result.returncode==0,result.stderr
+
+def test_mail_admin_and_inbox_can_mount_concurrently(tmp_path):
+    import subprocess
+    from pathlib import Path
+    script=r'''
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+class E{constructor(tag){this.tag=tag;this.children=[];this.dataset={};this.className='';this.classList={add:()=>{},toggle:()=>{}};this.isConnected=true;}
+append(...e){this.children.push(...e);}prepend(e){this.children.unshift(e);}replaceChildren(...e){this.children=e;}setAttribute(){}focus(){}
+querySelector(s){return this.children.find(e=>s==='[data-unread]'?Object.hasOwn(e.dataset,'unread'):e.className===s.slice(1))||this.children.map(e=>e.querySelector(s)).find(Boolean)||null;}}
+global.window={dispatchEvent:()=>{}};global.CustomEvent=class{};global.document={createElement:t=>new E(t)};global.setTimeout=()=>1;global.clearTimeout=()=>{};
+global.fetch=async(path)=>({ok:true,json:async()=>{
+ if(path.endsWith('/auth/session'))return {csrf_token:'token'};
+ if(path.endsWith('/auth/me'))return {user:{role:'admin'}};
+ if(path.includes('/mail/inbox'))return {items:[],cursor:0,unread:0};
+ if(path.endsWith('/mail/address'))return {email:'',verified:false};
+ if(path.endsWith('/admin/mail/config'))return {host:'smtp.qq.com',port:587,enabled:false};
+ throw Error(path);
+}});
+vm.runInThisContext(fs.readFileSync(process.argv[2],'utf8'));
+(async()=>{const admin=new E('div'),inbox=new E('div');await Promise.all([window.MailAdminUI.init(admin),window.CareerMail.init(inbox)]);
+ assert(admin.children.some(e=>e.tag==='form'),'SMTP configuration form must survive concurrent inbox initialization');
+ assert(inbox.querySelector('.mail-settings'),'Inbox must also finish initialization');
+})().catch(e=>{console.error(e);process.exitCode=1;});
+'''
+    harness=tmp_path/'mail-concurrent-check.cjs';harness.write_text(script,encoding='utf-8')
+    result=subprocess.run(['node',str(harness),str(Path('static/mail-ui.js').resolve())],capture_output=True,text=True,timeout=10)
+    assert result.returncode==0,result.stderr
 ```
 
 # 比赛演示脚本

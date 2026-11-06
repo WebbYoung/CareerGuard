@@ -85,4 +85,6 @@
     try{const result=await window.api('/account');if(version!==epoch)return;account=result;render();}
     catch(e){if(version===epoch)message('个人资料暂未加载：'+e.message,true);}
   }};
+  const ready=()=>{if(!initialized&&typeof platform!=='undefined'&&platform.user)window.AccountCard.load(platform.user);};
+  if(window.careerPlatformReady)ready();else window.addEventListener('platform-loaded',ready,{once:true});
 })();

@@ -18,6 +18,8 @@ from .company_api import router as company_router
 from .services import model_gateway
 from .assistant_api import router as assistant_router
 from .account_api import router as account_router
+from .recruitment_api import router as recruitment_router
+from .mail_api import router as mail_router
 from .services import vision
 
 
@@ -94,6 +96,8 @@ app.include_router(resume_router)
 app.include_router(company_router)
 app.include_router(assistant_router)
 app.include_router(account_router)
+app.include_router(recruitment_router)
+app.include_router(mail_router)
 app.mount('/static', StaticFiles(directory=ROOT/'static'), name='static')
 
 
@@ -108,6 +112,11 @@ async def company_register_page():
 
 
 @app.get('/company')
+@app.get('/company/overview')
+@app.get('/company/jobs')
+@app.get('/company/publish')
+@app.get('/company/candidates')
+@app.get('/company/mail')
 async def company_console_page(request:Request):
     from .platform_api import identity
     from fastapi import HTTPException

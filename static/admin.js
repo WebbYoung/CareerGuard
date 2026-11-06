@@ -31,7 +31,7 @@ async function init(){
   $('#injection-sample').addEventListener('change',e=>$('#injection-text').value=injectionSamples[e.target.value]);
   // 清空访客缓存是前台的数据操作，不在后台提供同名按钮。
   document.querySelectorAll('#admin-security [data-action=clear]').forEach(b=>b.remove());
-  document.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const handlers={'load-admin':loadAdmin,'save-model':saveModel,'test-model':testModel,'refresh-audit':refreshAudit,'check-injection':checkInjection};const fn=handlers[b.dataset.platform||b.dataset.action];if(fn)run(fn,b);if(b.dataset.go==='jobs')$('#admin-publish').scrollIntoView({behavior:'smooth'});});
+  document.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const handlers={'load-admin':loadAdmin,'save-model':saveModel,'test-model':testModel,'refresh-audit':refreshAudit,'check-injection':checkInjection};const fn=handlers[b.dataset.platform||b.dataset.action];if(fn)run(fn,b);if(b.dataset.go==='jobs'){window.AdminPages?.go('jobs');$('#admin-job-title').focus();}});
   await loadAdmin();
   window.CareerGuardAdminReady=true;
   document.dispatchEvent(new CustomEvent('admin-loaded'));

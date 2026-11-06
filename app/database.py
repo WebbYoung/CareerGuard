@@ -12,6 +12,8 @@ from .services.model_schema import SCHEMA as MODEL_SCHEMA
 from .services.resume_schema import SCHEMA as RESUME_SCHEMA
 from .services.company_schema import SCHEMA as COMPANY_SCHEMA
 from .services.assistant_schema import SCHEMA as ASSISTANT_SCHEMA
+from .services.recruitment_schema import SCHEMA as RECRUITMENT_SCHEMA
+from .services.mail_schema import SCHEMA as MAIL_SCHEMA
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -44,7 +46,7 @@ CREATE TABLE IF NOT EXISTS analyses(user_id INTEGER NOT NULL REFERENCES users(id
 '''
 
 
-SCHEMA += MODEL_SCHEMA + RESUME_SCHEMA + COMPANY_SCHEMA + ASSISTANT_SCHEMA
+SCHEMA += MODEL_SCHEMA + RESUME_SCHEMA + COMPANY_SCHEMA + ASSISTANT_SCHEMA + RECRUITMENT_SCHEMA + MAIL_SCHEMA
 
 
 @contextmanager

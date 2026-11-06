@@ -12,7 +12,7 @@
       refresh.disabled=true;message.textContent='正在读取企业材料…';
       try{csrf=(await call('/auth/session')).csrf_token;const {items}=await call('/admin/companies');list.replaceChildren();if(!items.length)list.append(node('p','暂无企业材料。'));
         for(const company of items){
-          const card=node('article');card.className='company-card';const heading=node('h3',company.name),badge=node('span',status[company.status]||company.status);badge.className='company-badge';card.append(heading,badge,node('p','统一社会信用代码：'+company.credit_code),node('p','联系人职务：'+company.contact_role),node('p','提交时间：'+company.created));
+          const card=node('article');card.className='company-card panel';const heading=node('h3',company.name),badge=node('span',status[company.status]||company.status);badge.className='company-badge';card.append(heading,badge,node('p','统一社会信用代码：'+company.credit_code),node('p','联系人职务：'+company.contact_role),node('p','提交时间：'+company.created));
           const notes=company.ocr_notes;card.append(node('p',notes.message),node('p','名称文字匹配：'+(notes.name_match===null?'未识别':notes.name_match?'一致':'未找到一致文字')+'；信用代码文字匹配：'+(notes.credit_code_match===null?'未识别':notes.credit_code_match?'一致':'未找到一致文字')));
           if(notes.detected_name)card.append(node('p','OCR名称候选：'+notes.detected_name));if(notes.detected_credit_codes?.length)card.append(node('p','OCR代码候选：'+notes.detected_credit_codes.join(' / ')));
           const original=node('a','查看营业执照原件');original.href='/api/admin/companies/'+company.id+'/license';original.target='_blank';original.rel='noopener';const download=node('a',' 下载原件');download.href=original.href;download.download='license-'+company.id;card.append(original,download);

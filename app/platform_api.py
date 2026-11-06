@@ -491,6 +491,9 @@ async def erase_learning(request:Request):
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
         db.execute('UPDATE users SET data_generation=data_generation+1 WHERE id=?',(user['id'],))
+        from .recruitment_api import clear_user_applications
+        clear_user_applications(db,user['id'])
+        db.execute('DELETE FROM mail_addresses WHERE user_id=?',(user['id'],))
         for table in ('account_details','assistant_threads','resume_sessions','exams','wrongbook','interviews','trees','profiles','materials','career_reports'):
             db.execute(f'DELETE FROM {table} WHERE user_id=?',(user['id'],))
         event(db,user['id'],'learning_erase')
@@ -528,9 +531,10 @@ async def practice(request:Request):
 
 
 class InterviewInput(Input):
-    occupation: str = Field(min_length=1,max_length=100)
-    jd: str = Field(default='',max_length=6000)
+    occupation: str = Field(min_length=1,max_length=160)
+    jd: str = Field(default='',max_length=12000)
     consent: bool = False
+    application_id: int | None = Field(default=None,gt=0)
 
 
 class Turn(Input):
@@ -542,6 +546,12 @@ class Turn(Input):
 async def interview_start(request:Request):
     user=current(request);data=await payload(request,InterviewInput);consent(data)
     occupation=growth.validate_input(data.occupation);jd=growth.validate_input(data.jd)
+    if data.application_id is not None:
+        from .recruitment_api import validate_application
+        with connect() as db:
+            application=validate_application(db,user,data.application_id,occupation)
+        # Linked interviews use the authorized job snapshot, never a substituted client JD.
+        jd=application['jd']
     reply=await compute(growth.generate_json,'扮演模拟面试官。根据岗位提出第一道具体问题，简短自然，每轮只问一道。feedback首轮为空，focus为考查技能。',{'occupation':occupation,'jd':jd},growth.InterviewReply)
     reply=growth.InterviewReply.model_validate(reply).model_dump()
     history=[{'role':'assistant','content':reply['question'],'feedback':reply['feedback'],'focus':reply['focus']}]
@@ -549,6 +559,9 @@ async def interview_start(request:Request):
     with connect() as db:
         write_guard(db,user)
         iid=db.execute('INSERT INTO interviews(user_id,occupation,history) VALUES (?,?,?)',(user['id'],occupation,encode(history))).lastrowid
+        if data.application_id is not None:
+            from .recruitment_api import attach_interview
+            attach_interview(db,user,data.application_id,iid,occupation)
         event(db,user['id'],'interview_start')
     return {'id':iid,**reply,'history':history}
 
@@ -591,7 +604,8 @@ async def end_interview(iid:int,request:Request):
 async def overview(request:Request):
     current(request,True)
     with connect() as db:
-        totals={table:db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] for table in ('users','jobs','reviews','trees','exams','interviews')}
+        totals={table:db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] for table in ('users','companies','jobs','reviews','trees','exams','interviews','mail_messages')}
+        totals['active_applications']=db.execute("SELECT COUNT(*) FROM job_applications WHERE status='active' AND share_resume=1").fetchone()[0]
         activity=[dict(r) for r in db.execute('SELECT action,COUNT(*) AS count FROM events GROUP BY action ORDER BY count DESC')]
         daily=[dict(r) for r in db.execute('SELECT date(created) AS day,COUNT(*) AS count FROM events GROUP BY day ORDER BY day DESC LIMIT 14')]
         totals['active_users_today']=db.execute("SELECT COUNT(DISTINCT user_id) FROM events WHERE date(created)=date('now')").fetchone()[0]

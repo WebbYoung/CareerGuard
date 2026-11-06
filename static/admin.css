@@ -2,3 +2,46 @@
 @media(max-width:750px){.admin-sidebar{position:relative;width:100%;padding:20px}.admin-brand{font-size:23px}.admin-brand small{display:inline;font-size:7px;margin-left:10px}.admin-caption{display:none}.admin-sidebar nav{display:flex;overflow:auto;gap:5px;margin-top:18px}.admin-sidebar nav a{white-space:nowrap;padding:8px 12px;font-size:11px}.admin-sidebar-foot{display:flex;flex-wrap:wrap;gap:20px;padding:15px 10px 0;margin:0}.admin-shell{margin:0}.admin-top{height:55px;padding:0 20px;font-size:10px}.admin-shell main{padding:25px 18px}.admin-surface>.page-heading h1{font-size:24px}.admin-shell .toast{left:50%}}
 
 #admin-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}#admin-metrics .panel{padding:21px}#admin-metrics .metric-value{font-size:29px}@media(max-width:1100px){#admin-metrics{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:750px){#admin-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}#admin-metrics .panel{padding:18px}}
+/* Admin pages share the site's glass, particle and meteor effect layer. */
+.admin-sidebar{width:248px;padding:27px 18px;overflow-y:auto;overscroll-behavior:contain;border-right:1px solid #83c8ff40}
+.admin-brand{padding:0 15px;color:#dceaff;text-shadow:0 0 28px #7dbaff65}
+.admin-caption{margin:28px 15px 12px;color:#91a7cb}
+.admin-sidebar nav{gap:5px}
+.admin-sidebar nav a{display:flex;align-items:center;gap:11px;min-height:46px;padding:9px 12px;color:#adbeda;border:1px solid transparent;border-radius:12px;font-size:12px}
+.admin-sidebar nav a:hover{background:#6e9bff16;color:#e6f2ff;border-color:#95c7ff35}
+.admin-sidebar nav a.active{background:linear-gradient(115deg,#67a7fa30,#ac81fa1c);color:#eef7ff;border-color:#91c6ff60;box-shadow:inset 2px 0 #8ad6ff,0 0 23px #669af725}
+.admin-sidebar nav a svg{height:29px;width:29px;flex:none}
+.admin-sidebar-foot{padding:24px 14px 0;gap:14px;font-size:11px}
+.admin-shell{margin-left:248px;min-height:100dvh}
+.admin-top{min-height:77px;height:auto;gap:18px;padding:20px 38px;flex-wrap:wrap}
+.admin-shell main{max-width:1600px;margin:0 auto;padding:35px 38px 60px}
+.admin-page{min-width:0}
+.admin-page[hidden],[data-admin-page][hidden]{display:none!important}
+.admin-surface>.page-heading{margin-bottom:28px;gap:22px}
+.admin-surface>.page-heading h1{font-size:clamp(24px,2.7vw,34px);line-height:1.35;letter-spacing:-.6px;color:#e1edff;text-shadow:0 0 35px #9bcaff30}
+#admin-page-title:focus{outline:none}
+.admin-surface>.page-heading p{max-width:680px;line-height:1.9;color:#a8b9d7}
+.admin-page>.panel:first-child{margin-top:0}
+.admin-page .two-col{grid-template-columns:minmax(0,1fr)}
+#admin-ai-settings:not([hidden]){display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;align-items:start}
+#admin-ai-settings>.panel{margin:0;min-width:0}
+#admin-ai-settings>[data-admin-page=knowledge]{grid-column:1/-1}
+.admin-security{border:0;padding:0;margin:0}
+.admin-security>.page-heading{display:none}
+.admin-security .two-col{grid-template-columns:repeat(2,minmax(0,1fr))}
+.admin-row{gap:16px;min-width:0;flex-wrap:wrap}
+.admin-row>div:first-child{flex:1 1 360px;min-width:0}
+.admin-row p,.admin-row strong{overflow-wrap:anywhere}
+.admin-page .button,.admin-security .button{min-height:40px}
+.admin-page .panel h3,.admin-security h3{color:#dceaff}
+.admin-page .field input,.admin-page .field textarea,.admin-page .field select{max-width:100%;min-width:0}
+.admin-page .two-col.spaced{margin-top:22px}
+#admin-mail-settings:empty,#admin-mail-content:empty{display:none}
+#admin-mail-content{margin-top:24px}
+@media(min-width:751px){.admin-sidebar{height:100dvh}.admin-sidebar-foot{margin-top:auto}.admin-top{position:relative;z-index:2}}
+@media(max-width:1050px){#admin-ai-settings:not([hidden]),.admin-security .two-col{grid-template-columns:minmax(0,1fr)}.admin-shell main{padding:28px 24px 45px}.admin-top{padding:20px 24px}}
+@media(max-width:750px){.admin-sidebar{width:100%;padding:18px;overflow:visible}.admin-brand{padding:0 4px}.admin-sidebar nav{display:flex;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:thin;padding:0 0 7px}.admin-sidebar nav a{min-height:44px;flex-shrink:0;gap:6px;padding:7px 10px;font-size:11px}.admin-sidebar nav a svg{height:25px;width:25px}.admin-sidebar-foot{display:flex;gap:18px;padding:12px 4px 0}.admin-shell{margin-left:0}.admin-top{padding:16px 20px;gap:10px;font-size:10px}.admin-shell main{padding:24px 18px 40px}.admin-surface>.page-heading{align-items:flex-start;flex-wrap:wrap;margin-bottom:24px}.admin-row>div:first-child{flex-basis:100%}}
+
+/* Keep the pre-mount legacy fragments from flashing as a long page. */
+.admin-shell main[aria-busy="true"] #view-admin{visibility:hidden}
+.admin-shell main[aria-busy="true"]:before{content:"正在载入管理页面…";display:block;color:#9baecc;font-size:13px;padding:24px 0}

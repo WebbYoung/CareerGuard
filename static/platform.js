@@ -1,6 +1,6 @@
 'use strict';
 // 原生界面扩展。所有用户和模型内容以 textContent 渲染。
-const platform={user:null,tree:null,jobs:[],exam:null,interview:null,reviewJob:null,
+const platform={user:null,tree:null,jobs:[],exam:null,interview:null,reviewJob:null,applicationId:null,applicationJob:null,
   skills:[],pending:false,recognition:null,listening:false,voiceTimer:null,silenceTimer:null,voiceEpoch:0,interviewEpoch:0};
 const extTitles={tree:'职业技能树',exam:'技能考试',interview:'AI 面试',jobs:'岗位推荐',profile:'个人中心'};
 Object.assign(titles,extTitles);
@@ -39,7 +39,8 @@ async function logout(){
   location.assign('/');
 }
 function resetPlatform(){
-  platform.editJob=null;window.CameraAssist?.stop();window.StarMap?.clearAll();
+  platform.editJob=null;platform.applicationId=null;platform.applicationJob=null;window.CameraAssist?.stop();window.StarMap?.clearAll();
+  if($('#interview-application-note'))$('#interview-application-note').hidden=true;
   stopVoice();platform.interviewEpoch++;platform.tree=null;platform.exam=null;platform.interview=null;platform.skills=[];
   ['#profile-occupation','#profile-resume','#tree-major','#tree-occupation','#tree-jd','#interview-occupation','#interview-jd','#interview-answer','#voice-interim','#review-body','#admin-key'].forEach(s=>{const el=$(s);if(el){if('value'in el)el.value='';else el.textContent='';}});
   ['#tree-scene','#node-selection','#exam-questions','#exam-result','#wrongbook-list','#interview-history','#exam-history','#profile-materials','#profile-reports','#interview-messages','#admin-metrics','#admin-users','#admin-reviews','#admin-jobs','#review-list'].forEach(s=>$(s)?.replaceChildren());
@@ -121,7 +122,7 @@ function renderJobs(){
   const root=$('#job-list'),query=$('#job-search').value.trim().toLowerCase();root.replaceChildren();
   const jobs=platform.jobs.filter(j=>[j.title,j.company,j.description].join(' ').toLowerCase().includes(query));
   jobs.forEach(j=>{const card=node('article','panel job-card');card.append(node('span','badge '+(j.recommended?'green':'neutral'),j.recommended?'管理员推荐 · 待自行核验':'用户分享 · 未核验'),node('h3','',j.title),node('strong','',j.company),node('p','job-description',j.description),node('p','fine-print',`${j.rating===null?'暂无评分':j.rating+' / 5 分'} · ${j.review_count} 条点评`));
-    const row=node('div','button-row');row.append(button('用于职业规划',async()=>{await addText(j.description,'jd');$('#tree-occupation').value=j.title;$('#tree-jd').value=j.description;$('#interview-occupation').value=j.title;$('#interview-jd').value=j.description.slice(0,6000);show('career');toast('岗位已加入 JD 材料，可选择简历生成报告。');}),button('查看 / 写点评',()=>openReviews(j)));card.append(row);root.append(card);});
+    const row=node('div','button-row');row.append(button('用于职业规划',async()=>{await addText(j.description,'jd');$('#tree-occupation').value=j.title;$('#tree-jd').value=j.description;$('#interview-occupation').value=j.title;$('#interview-jd').value=j.description.slice(0,6000);show('career');toast('岗位已加入 JD 材料，可选择简历生成报告。');}),button('查看 / 写点评',()=>openReviews(j)));row.prepend(button('一键面试',()=>window.RecruitmentUI.open(j),'primary'));card.append(row);root.append(card);});
   if(!jobs.length)empty(root,'暂无匹配岗位。管理员可以添加推荐岗位，登录用户也可手动分享。');
 }
 async function publishJob(){
@@ -170,7 +171,7 @@ function renderConversation(history){
 }
 async function startInterview(){
   signed();consentChecked('#interview-consent');stopVoice();platform.interviewEpoch++;const epoch=platform.interviewEpoch;
-  const result=await api('/interviews',{method:'POST',data:{occupation:$('#interview-occupation').value.trim(),jd:$('#interview-jd').value.trim(),consent:true}});if(epoch!==platform.interviewEpoch||state.view!=='interview')return;
+  const result=await api('/interviews',{method:'POST',data:{occupation:$('#interview-occupation').value.trim(),jd:$('#interview-jd').value.trim(),consent:true,application_id:platform.applicationId}});if(epoch!==platform.interviewEpoch||state.view!=='interview')return;
   platform.interview=result;$('#interview-answer').value='';renderConversation(result.history);speakQuestion(result.question);
 }
 async function sendAnswer(){
@@ -191,8 +192,8 @@ function inheritCareer(result,jd){
 const platformHandlers={logout,'save-profile':saveProfile,'use-profile':useProfile,
   'refresh-profile':async()=>{signed();await loadProfile();},'generate-tree':generateTree,'load-trees':loadTrees,
   'submit-exam':submitExam,practice,'load-jobs':loadJobs,'publish-job':publishJob,'save-review':saveReview,
-  'start-interview':startInterview,'send-answer':sendAnswer,'end-interview':endInterview,listen,interrupt:()=>{stopVoice();text('#voice-status','已停止听写与朗读，文字仍可编辑。');},
-  'erase-learning':async()=>{signed();if(!confirm('删除当前账号的头像、昵称、简介、材料、档案、职业报告、技能树、考试、错题与面试记录？此操作不可恢复，已发布岗位和点评保留。'))return;stopVoice();platform.interviewEpoch++;await api('/profile/data',{method:'DELETE'});resetPlatform();window.dispatchEvent(new Event('account-data-erased'));await loadAccount();await loadProfile();toast('个人档案和学习记录已删除。');}
+  'detach-application':()=>{platform.applicationId=null;platform.applicationJob=null;$('#interview-application-note').hidden=true;toast('已切换为个人练习；已有投递可在我的投递中撤回。');},'my-applications':()=>window.RecruitmentUI.mine(),'start-interview':startInterview,'send-answer':sendAnswer,'end-interview':endInterview,listen,interrupt:()=>{stopVoice();text('#voice-status','已停止听写与朗读，文字仍可编辑。');},
+  'erase-learning':async()=>{signed();if(!confirm('删除当前账号的头像、昵称、简介、材料、档案、职业报告、技能树、考试、错题与面试记录？此操作不可恢复，已发布岗位、点评与站内邮件保留；已投递的简历授权将撤回。'))return;stopVoice();platform.interviewEpoch++;await api('/profile/data',{method:'DELETE'});resetPlatform();window.dispatchEvent(new Event('account-data-erased'));await loadAccount();await loadProfile();toast('个人档案和学习记录已删除。');}
 };
 
 async function initPlatform(){
