@@ -232,3 +232,7 @@ career-guard/
 ## 强化特效与机器人引导 v0.12.0
 
 右上角可切换全开/轻量/关闭视觉效果。首页与工作台右侧为小安机器人；新注册账号自动进入引导，旧账号可点击机器人重放。引导进度按账号保存，无需新增部署服务。Three.js依赖已随源码本地打包。详见 `docs/VISUAL_EFFECTS.md` 与 `docs/ROBOT_GUIDE.md`。
+
+## 许可
+
+本项目以 [MIT License](LICENSE) 开源。
