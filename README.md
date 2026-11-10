@@ -6,6 +6,7 @@
 </p>
 
 <p align="center">
+  <a href="http://zhian.qd.je/"><img alt="Live" src="https://img.shields.io/badge/LIVE-zhian.qd.je-2ea043" /></a>
   <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776AB" />
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.115%2B-009688" />
   <img alt="Storage" src="https://img.shields.io/badge/storage-SQLite-003B57" />
@@ -24,6 +25,9 @@
 这是金砖大赛「AI+ 应用创新与安全设计」赛项的作品 MVP，依据本项目提供的需求实现，不代表赛事官方认证或评分承诺。
 
 ---
+
+**想直接打开看看？**<br />
+线上地址 [http://zhian.qd.je/](http://zhian.qd.je/) ，公开可访问。目前只提供 HTTP（HTTPS 需先给域名配证书，站点在 Lightsail 上用 nginx 反代到本机服务）。
 
 **想在本机跑起来？**<br />
 `.venv` 已就绪，Windows 双击 `start.bat` 或 `start.ps1`；依赖与命令见[启动步骤](#启动步骤先启动界面与规则功能)。
