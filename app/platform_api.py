@@ -59,14 +59,14 @@ def rotate(request,response,uid=None):
             del store.sessions[old]
     sid,session=store.bootstrap(None)
     if uid:store.bind(sid,uid)
-    response.set_cookie('cg_session',sid,httponly=True,samesite='strict',path='/')
+    response.set_cookie('cg_session',sid,httponly=True,samesite=config.COOKIE_SAMESITE,secure=config.COOKIE_SECURE,path='/')
     with connect() as db:
         token=request.cookies.get('cg_auth','')
         db.execute('DELETE FROM auth_sessions WHERE token=? OR expires<?',(hashlib.sha256(token.encode()).hexdigest(),int(time.time())))
         if uid:
             token=secrets.token_urlsafe(40)
             db.execute('INSERT INTO auth_sessions VALUES (?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),uid,int(time.time())+604800))
-            response.set_cookie('cg_auth',token,httponly=True,samesite='strict',path='/')
+            response.set_cookie('cg_auth',token,httponly=True,samesite=config.COOKIE_SAMESITE,secure=config.COOKIE_SECURE,path='/')
         else:
             response.delete_cookie('cg_auth',path='/')
     return session.csrf
@@ -131,7 +131,7 @@ async def login(request:Request,response:Response):
 @router.get('/auth/session')
 async def auth_session(request:Request,response:Response):
     sid,session=store.bootstrap(request.cookies.get('cg_session'))
-    response.set_cookie('cg_session',sid,httponly=True,samesite='strict',path='/')
+    response.set_cookie('cg_session',sid,httponly=True,samesite=config.COOKIE_SAMESITE,secure=config.COOKIE_SECURE,path='/')
     return {'csrf_token':session.csrf}
 
 

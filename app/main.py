@@ -1,11 +1,13 @@
 """单进程本机服务入口：python run.py。"""
 import asyncio
+import os
 from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from .config import ROOT
+from starlette.middleware.cors import CORSMiddleware
+from .config import ROOT, CORS_ORIGINS
 from .api import router
 from .store import store
 from .platform_api import router as platform_router, load_model_settings
@@ -45,18 +47,24 @@ async def lifespan(app):
 
 
 app = FastAPI(title='求职安全体检平台', docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1','localhost','testserver'])
+# 默认只信任本机 Host；部署到反向代理后由 EXTRA_ALLOWED_HOSTS 追加对外域名/IP，逗号分隔。
+_ALLOWED_HOSTS = ['127.0.0.1', 'localhost', 'testserver'] + [
+    h.strip() for h in os.getenv('EXTRA_ALLOWED_HOSTS', '').split(',') if h.strip()]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=_ALLOWED_HOSTS)
 
 
 @app.middleware('http')
 async def security_headers(request: Request, call_next):
     origin = request.headers.get('origin')
+    origin_norm = origin.rstrip('/') if origin else ''
+    # 白名单跨域来源（EXTRA_CORS_ORIGINS）不算跨站，交给 CORSMiddleware 处理。
+    cors_origin = bool(origin_norm) and origin_norm in CORS_ORIGINS
     home_navigation = (request.method == 'GET' and request.url.path == '/' and
                        request.headers.get('sec-fetch-mode') == 'navigate' and
                        request.headers.get('sec-fetch-dest') == 'document')
-    if origin and origin != str(request.base_url).rstrip('/'):
+    if origin and origin_norm != str(request.base_url).rstrip('/') and not cors_origin:
         response = JSONResponse({'detail':'拒绝跨站请求。'}, status_code=403)
-    elif request.headers.get('sec-fetch-site') == 'cross-site' and not home_navigation:
+    elif request.headers.get('sec-fetch-site') == 'cross-site' and not home_navigation and not cors_origin:
         response = JSONResponse({'detail':'拒绝跨站请求。'}, status_code=403)
     else:
         protected=('/api/materials','/api/risk','/api/privacy','/api/career','/api/audit','/api/session/data','/api/jobs')
@@ -75,9 +83,23 @@ async def security_headers(request: Request, call_next):
         'Cache-Control':'no-store', 'Pragma':'no-cache', 'X-Content-Type-Options':'nosniff',
         'Referrer-Policy':'no-referrer', 'X-Frame-Options':'DENY',
         'Permissions-Policy':'camera=(self), microphone=(self), geolocation=()',
-        'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src "+' '.join(["'self'", *CORS_ORIGINS])+"; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
     })
     return response
+
+
+# 必须在 security_headers 之后注册：add_middleware 后加的在外层，
+# 这样 CORS 预检在进入上面那道跨站判定之前就被处理掉。
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(CORS_ORIGINS),
+        allow_credentials=True,
+        allow_methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+        allow_headers=['Accept', 'Content-Type', 'X-CSRF-Token', 'X-Requested-With', 'Authorization'],
+        expose_headers=['X-CSRF-Token'],
+        max_age=600,
+    )
 
 
 @app.exception_handler(Exception)

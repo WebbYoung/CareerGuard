@@ -102,7 +102,7 @@ async def bootstrap(request: Request, response: Response):
         store.bind(sid,user['id'])
     except HTTPException as exc:
         if exc.status_code!=401:raise
-    response.set_cookie('cg_session', sid, httponly=True, samesite='strict', path='/')
+    response.set_cookie('cg_session', sid, httponly=True, samesite=config.COOKIE_SAMESITE,secure=config.COOKIE_SECURE, path='/')
     return {'csrf_token':session.csrf, 'ttl_minutes':config.SESSION_TTL//60,
             'limits':{'upload_mb':8,'pdf_pages':8,'text_chars':config.MAX_TEXT,'materials':24},
             'models':{'ocr':{'configured':ocr.model_configured(),'name':'PaddleOCR · PP-OCRv5'},
