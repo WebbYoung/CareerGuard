@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="260" viewBox="0 0 1200 260" role="img" aria-label="CareerGuard">
+  <title>CareerGuard</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d1117"/>
+      <stop offset="1" stop-color="#161b22"/>
+    </linearGradient>
+    <linearGradient id="rail" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f6feb"/>
+      <stop offset="1" stop-color="#3fb950"/>
+    </linearGradient>
+    <clipPath id="plate">
+      <rect width="1200" height="260" rx="16"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#plate)">
+    <rect width="1200" height="260" fill="url(#bg)"/>
+    <rect x="0" y="0" width="8" height="260" fill="url(#rail)"/>
+    <circle cx="1090" cy="40" r="160" fill="#3fb950" opacity="0.08"/>
+    <circle cx="150" cy="250" r="120" fill="#1f6feb" opacity="0.06"/>
+  </g>
+  <rect x="1" y="1" width="1198" height="258" rx="15" fill="none" stroke="#30363d" stroke-width="2"/>
+
+  <text x="64" y="134" font-family="Inter, 'Segoe UI', 'Noto Sans CJK SC', system-ui, sans-serif"
+        font-size="60" font-weight="700" fill="#f0f6fc" letter-spacing="-0.5">CareerGuard</text>
+  <rect x="66" y="168" width="46" height="4" rx="2" fill="#3fb950"/>
+  <text x="64" y="216" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace"
+        font-size="20" font-weight="400" fill="#7d8590">FastAPI · SQLite · PaddleOCR · MediaPipe</text>
+</svg>

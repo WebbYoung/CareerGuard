@@ -1,14 +1,51 @@
-# 职安 · AI 求职安全与职业规划助手
+<h1 align="center">CareerGuard</h1>
+<h3 align="center">职安 · AI 求职安全与职业规划助手</h3>
 
-金砖大赛 AI+ 应用创新与安全设计赛项作品 MVP。依据本项目提供的需求实现，不代表赛事官方认证或评分承诺。界面使用原生 HTML、CSS、JavaScript，后端使用 Python；按最新需求加入账号、SQLite、管理后台、AI技能树、考试错题和语音模拟面试。
+<p align="center">
+  <img src="docs/banner.svg" alt="CareerGuard" width="900" />
+</p>
 
-**本机部署状态更新**：本地PaddleOCR已部署，DeepSeek `deepseek-flash` 已接入并通过真实合成材料调用。原有密钥从本机 `.env` 读取，管理员修改后加密保存在本机运行目录。风险和原有职业报告仅发送脱敏结构化证据；新技能树和面试功能需用户确认后发送相应岗位文本、所选技能或逐轮回答。原始文件不上传。当前目录 `.venv` 可通过 `start.bat` 或 `start.ps1` 启动。详情见 [OCR部署记录](docs/OCR_DEPLOYMENT.md) 与 [DeepSeek接入记录](docs/DEEPSEEK_SETUP.md)。
+<p align="center">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776AB" />
+  <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.115%2B-009688" />
+  <img alt="Storage" src="https://img.shields.io/badge/storage-SQLite-003B57" />
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-3DA639" />
+  <a href="https://github.com/WebbYoung/CareerGuard/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/WebbYoung/CareerGuard" /></a>
+</p>
 
-摄像头练习辅助已部署本机MediaPipe人脸与手部关键点模型，详见 [部署与使用](docs/VISION_DEPLOYMENT.md)。画面不进入资料库或云端AI，不用于身份、情绪或面试成绩判断。
+---
 
-**新增 AI 工作区（v0.13.0）**：对话简历与Word导出、AI证件照、小安Agent聊天、OpenAI兼容/Anthropic模型配置、SQLite向量知识库、企业入驻与岗位审核。新增服务按要求未进行真实模型联调；配置后手动启动Embedding索引。参见 [配置与验收](docs/AI_WORKSPACE.md)。原始自拍不落盘；营业执照按企业授权加密保存用于人工审核。
+上传简历、JD 或招聘截图，本机 OCR 先把文字抽出来，规则层做 PII 识别与脱敏，之后才把**脱敏后的结构化证据**交给模型。风险分数、脱敏结果、检索依据全部由确定性代码产出，模型只负责解释已有线索、组织措辞 —— 它没有机会自己编一个分数。
 
-**后台与招聘沟通（v0.14.0）**：网站后台九页、企业后台五页，统一完整特效；岗位一键面试准备、授权投递与企业履历查看、实际面试人数、站内邮件和未读提醒。支持可选SMTP和主动验证邮箱，保存不测试、不自动发信。详见 [操作与配置说明](docs/RECRUITMENT_MAIL.md)。个人中心已支持 [头像与昵称资料卡](docs/ACCOUNT_CARD.md)。
+三块能力串成一条线：材料风险体检（风险分级 / 原文线索高亮 / 核验建议）→ 职业规划（技能树与星图、能力差距、4 周学习计划、岗位面试练习）→ 模拟面试（文字或浏览器语音，含考试错题复盘，可选摄像头姿态辅助）。
+
+界面是原生 HTML / CSS / JavaScript，没有外部字体、脚本和图片，也不写 localStorage；后端 FastAPI + SQLite，全程同源请求 + HttpOnly 会话 Cookie + CSRF Token。**原始文件不上传**，模型侧不配置用户 URL、不跟随重定向、不启用工具调用；风险体检与职业报告只发脱敏结构化证据，技能树与面试功能需要用户确认后才发送相应岗位文本、所选技能或逐轮回答。
+
+这是金砖大赛「AI+ 应用创新与安全设计」赛项的作品 MVP，依据本项目提供的需求实现，不代表赛事官方认证或评分承诺。
+
+---
+
+**想在本机跑起来？**<br />
+`.venv` 已就绪，Windows 双击 `start.bat` 或 `start.ps1`；依赖与命令见[启动步骤](#启动步骤先启动界面与规则功能)。
+
+**想看三个模型各自怎么接的？**<br />
+[OCR 部署记录](docs/OCR_DEPLOYMENT.md) · [DeepSeek 接入记录](docs/DEEPSEEK_SETUP.md) · [摄像头与 MediaPipe](docs/VISION_DEPLOYMENT.md)。
+
+**想部署到服务器？**<br />
+支持反向代理：Host 与 CORS 白名单、可配置 Cookie 属性，见[平台扩展说明](docs/PLATFORM_GUIDE.md)。
+
+**想核对隐私边界？**<br />
+[结论边界](#结论边界)一节逐条写了什么会发出去、什么不会。
+
+---
+
+## 当前状态
+
+- **本机 OCR**：PaddleOCR 已部署，含 PDF 逐页渲染与逐行置信度；接口与模型路径见 [OCR 部署记录](docs/OCR_DEPLOYMENT.md)。
+- **模型接入**：DeepSeek `deepseek-flash` 已接入并用真实合成材料跑通。密钥从本机 `.env` 读取，管理员修改后加密保存在本机运行目录，见 [DeepSeek 接入记录](docs/DEEPSEEK_SETUP.md)。
+- **摄像头练习辅助**：本机 MediaPipe 人脸与手部关键点模型已部署。画面不进入资料库或云端 AI，不用于身份、情绪或面试成绩判断，见[部署与使用](docs/VISION_DEPLOYMENT.md)。
+- **v0.13.0 AI 工作区**：对话简历与 Word 导出、AI 证件照、小安 Agent 聊天、OpenAI 兼容 / Anthropic 模型配置、SQLite 向量知识库、企业入驻与岗位审核。新增服务按要求未做真实模型联调，配置后需手动启动 Embedding 索引；原始自拍不落盘，营业执照按企业授权加密保存用于人工审核，见[配置与验收](docs/AI_WORKSPACE.md)。
+- **v0.14.0 后台与招聘沟通**：网站后台九页、企业后台五页，统一完整特效；岗位一键面试准备、授权投递与企业履历查看、实际面试人数、站内邮件与未读提醒；SMTP 可选，保存不测试、不自动发信，见[操作与配置说明](docs/RECRUITMENT_MAIL.md)。个人中心资料卡见[头像与昵称](docs/ACCOUNT_CARD.md)。
 
 ## ① 项目整体架构、依赖与启动
 
